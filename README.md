@@ -4,6 +4,9 @@ Physics-informed, interpretable health monitoring for a two-spool turbofan, trai
 (C-MAPSS 2, Kaggle mirror `bishals098/nasa-cmapss-2-engine-degradation`). It predicts component-wise health
 indices (fan, LPC, HPC, HPT, LPT) and remaining useful life, and explains every prediction.
 
+> **ML team:** the full training guide (dataset, training script, configuration, pipeline, outputs, current results,
+> troubleshooting, open tasks) is in **[training/README.md](training/README.md)**.
+
 ## Pipeline
 1. **Ingestion & preprocessing** – 1 Hz flight data aggregated to one row per flight cycle; per-engine healthy baseline.
 2. **Physics model** – efficiency proxies and pressure ratios from measured sensors; a healthy-engine map predicts the
@@ -23,6 +26,19 @@ indices (fan, LPC, HPC, HPT, LPT) and remaining useful life, and explains every 
 2. Unzip the bundle into `backend/models/`.
 3. `pip install -r backend/requirements.txt` then `python -m backend` and open http://localhost:8000.
 4. Optional check: `python -m backend.check_parity`.
+
+Current bundle in `backend/models/`: full run on DS01–DS07 (before the CNN). Test RUL RMSE 7.5 flights (2.0 in the
+last 20 flights) against 15.1 for a naive linear baseline; see [training/README.md](training/README.md#5-current-results).
+
+## Repository layout
+| Path | Content |
+|---|---|
+| `training/` | Colab training notebook + its source script, notebook builder, **training guide** |
+| `backend/pipeline/ncmapss.py` | shared pipeline code (used by training and serving) |
+| `backend/` | FastAPI service, bundle loader, parity check, tests |
+| `backend/models/` | the trained model bundle served by the dashboard |
+| `public/` | dashboard (HTML/JS, 3D engine model) |
+| `docs/` | project documents, reference papers, the raw full-run bundle |
 
 Details, limits and API: `backend/README.md`. The notebook is generated from `training/ncmapss_colab_training.py`
 (`python training/build_notebook.py`) so it always contains the same pipeline code as the backend.
