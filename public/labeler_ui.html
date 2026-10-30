@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3D CAD Bounding Box Labeler</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #12181f;
+    --panel-border: #232b35;
+    --grid-line: #1a222b;
+    --ink: #d7dee6;
+    --ink-dim: #7c8896;
+    --ink-faint: #4a5561;
+    --teal: #4fd1b5;
+    --amber: #e8b34c;
+    --yellow: #f5d442;
+    --red: #e2564f;
+    --cyan: #5fb3d9;
+    --accent: #38bdf8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'IBM Plex Sans', sans-serif;
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  
+  /* Viewport Layout */
+  .viewport-area {
+    flex: 1;
+    position: relative;
+    height: 100%;
+    background: radial-gradient(ellipse at 50% 45%, #171f28 0%, #0d1117 78%);
+  }
+  #canvas3d {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: grab;
+  }
+  #canvas3d:active { cursor: grabbing; }
+
+  /* Info HUD */
+  .hud-hint {
+    position: absolute;
+    bottom: 16px;
+    left: 20px;
+    font-size: 10.5px;
+    color: var(--ink-dim);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    background: rgba(18, 24, 31, 0.7);
+    padding: 6px 12px;
+    border: 1px solid var(--panel-border);
+    border-radius: 2px;
+    pointer-events: none;
+  }
+
+  /* Sidebar Controls */
+  .sidebar {
+    width: 380px;
+    background: var(--panel);
+    border-left: 1px solid var(--panel-border);
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    overflow-y: auto;
+    padding: 20px;
+  }
+  .section {
+    margin-bottom: 22px;
+    border-bottom: 1px solid var(--grid-line);
+    padding-bottom: 18px;
+  }
+  .section:last-child {
+    border-bottom: none;
+  }
+  .section-title {
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    font-weight: 700;
+    margin-bottom: 12px;
+  }
+
+  /* Form Elements */
+  label {
+    display: block;
+    font-size: 10.5px;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 5px;
+    margin-top: 10px;
+  }
+  input[type="text"], select {
+    width: 100%;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--panel-border);
+    color: var(--ink);
+    padding: 8px 12px;
+    font-size: 12px;
+    border-radius: 2px;
+    outline: none;
+  }
+  input[type="text"]:focus, select:focus {
+    border-color: var(--cyan);
+  }
+
+  /* Sliders */
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 8px;
+  }
+  .slider-row label {
+    width: 60px;
+    margin: 0;
+    font-size: 9px;
+  }
+  input[type="range"] {
+    flex: 1;
+    height: 4px;
+    background: var(--grid-line);
+    border-radius: 2px;
+    outline: none;
+    -webkit-appearance: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--cyan);
+    cursor: pointer;
+  }
+  .slider-val {
+    width: 50px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    text-align: right;
+    color: var(--ink);
+  }
+
+  /* Buttons */
+  .btn {
+    width: 100%;
+    padding: 10px;
+    border-radius: 2px;
+    border: none;
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-top: 10px;
+  }
+  .btn-primary {
+    background: var(--cyan);
+    color: #0d1117;
+  }
+  .btn-primary:hover {
+    background: var(--accent);
+    box-shadow: 0 0 8px rgba(95, 179, 217, 0.3);
+  }
+
+  /* Segmented Mode Control */
+  .btn-mode {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--panel-border);
+    color: var(--ink-dim);
+    padding: 6px;
+    font-size: 10px;
+    font-weight: 700;
+    cursor: pointer;
+    border-radius: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    transition: all 0.15s ease;
+  }
+  .btn-mode:hover {
+    border-color: var(--cyan);
+    color: var(--ink);
+  }
+  .btn-mode.active {
+    background: rgba(79, 209, 181, 0.1);
+    border-color: var(--teal);
+    color: var(--teal);
+    box-shadow: 0 0 8px rgba(79, 209, 181, 0.15);
+  }
+  
+  /* Status/Console Log */
+  .status-box {
+    background: #090d12;
+    border: 1px solid var(--grid-line);
+    border-radius: 2px;
+    padding: 8px 12px;
+    font-size: 11.5px;
+    height: 60px;
+    overflow-y: auto;
+    color: var(--teal);
+    margin-top: 10px;
+  }
+
+  /* List of Saved Labels */
+  .saved-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .saved-item {
+    background: rgba(255,255,255,0.01);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 11.5px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: all 0.15s ease;
+  }
+  .saved-item:hover {
+    background: rgba(255,255,255,0.03);
+    border-color: var(--accent);
+  }
+  .action-btn {
+    background: none;
+    border: none;
+    color: var(--ink-dim);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 3px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s ease;
+  }
+  .action-btn:hover {
+    color: var(--accent);
+    background: rgba(56, 189, 248, 0.1);
+  }
+  .action-btn.btn-delete:hover {
+    color: var(--red);
+    background: rgba(226, 86, 79, 0.1);
+  }
+</style>
+</head>
+<body>
+
+  <!-- VIEWPORT AREA -->
+  <div class="viewport-area">
+    <canvas id="canvas3d"></canvas>
+    <div class="hud-hint">
+      Orbit: Left Click + Drag &nbsp;·&nbsp; Zoom: Scroll &nbsp;·&nbsp; Pan: Right Click + Drag &nbsp;·&nbsp; <b>Click Model to position Box Center</b>
+    </div>
+  </div>
+
+  <!-- CONTROL SIDEBAR -->
+  <div class="sidebar">
+    <h2 style="font-size:15px; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:12px; border-bottom:1px solid var(--panel-border); padding-bottom:12px;">3D Box Labeler</h2>
+
+    <!-- Mode Selector Segmented Control -->
+    <div style="display:flex; gap:8px; margin-bottom:18px;">
+      <button id="mode-orbit" class="btn-mode active" style="flex:1;">Orbit Mode</button>
+      <button id="mode-draw" class="btn-mode" style="flex:1;">Draw Mode</button>
+    </div>
+
+    <!-- SECTION 1: Active Target -->
+    <div class="section">
+      <div class="section-title">Active Bounding Box</div>
+      
+      <label>Target Component ID (Type any custom key)</label>
+      <input type="text" id="box-key" value="inlet" list="preset-keys" placeholder="e.g. compressor, stator_blade_2">
+      <datalist id="preset-keys">
+        <option value="inlet"></option>
+        <option value="compressor"></option>
+        <option value="combustor"></option>
+        <option value="turbine"></option>
+        <option value="nozzle"></option>
+      </datalist>
+
+      <label>Description</label>
+      <input type="text" id="box-desc" value="Four-stage Compressor" placeholder="Enter notes...">
+    </div>
+
+    <!-- SECTION 2: Bounding Box Controls -->
+    <div class="section">
+      <div class="section-title">Box Position offsets</div>
+      <div class="slider-row">
+        <label>Offset X</label>
+        <input type="range" id="off-x" min="-300" max="300" value="0">
+        <div class="slider-val" id="val-off-x">0</div>
+      </div>
+      <div class="slider-row">
+        <label>Offset Y</label>
+        <input type="range" id="off-y" min="-300" max="300" value="0">
+        <div class="slider-val" id="val-off-y">0</div>
+      </div>
+      <div class="slider-row">
+        <label>Offset Z</label>
+        <input type="range" id="off-z" min="-300" max="300" value="0">
+        <div class="slider-val" id="val-off-z">0</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Box Dimensions</div>
+      <div class="slider-row">
+        <label>Width (X)</label>
+        <input type="range" id="size-w" min="5" max="600" value="150">
+        <div class="slider-val" id="val-size-w">150</div>
+      </div>
+      <div class="slider-row">
+        <label>Height (Y)</label>
+        <input type="range" id="size-h" min="5" max="600" value="150">
+        <div class="slider-val" id="val-size-h">150</div>
+      </div>
+      <div class="slider-row">
+        <label>Depth (Z)</label>
+        <input type="range" id="size-d" min="5" max="600" value="150">
+        <div class="slider-val" id="val-size-d">150</div>
+      </div>
+    </div>
+
+    <!-- SECTION 3: Live Coordinates -->
+    <div class="section">
+      <div class="section-title">Output Parameters</div>
+      <div style="font-size:10.5px; line-height:1.6;" class="mono">
+        <div>Center: <span id="out-center" style="color:var(--yellow)">[0, 0, 0]</span></div>
+        <div>Size: &nbsp;&nbsp;<span id="out-size" style="color:var(--yellow)">[150, 150, 150]</span></div>
+      </div>
+      
+      <button class="btn btn-primary" id="save-btn">Save Box Label</button>
+      
+      <div class="status-box mono" id="console-log">Ready. Click model to select target.</div>
+    </div>
+
+    <!-- SECTION 4: Saved Labels List -->
+    <div class="section">
+      <div class="section-title">Saved Bounding Boxes</div>
+      <div class="saved-list" id="saved-list">
+        <div style="font-size:11px; color:var(--ink-faint)">No boxes saved yet.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  let scene, camera, renderer, controls, model;
+  let previewBox;
+  let clickedPoint = new THREE.Vector3(0, 0, 0);
+  
+  // Track parameters
+  let boxOffsetX = 0, boxOffsetY = 0, boxOffsetZ = 0;
+  let boxSizeW = 150, boxSizeH = 150, boxSizeD = 150;
+  let activeKey = 'inlet';
+  let activeDesc = 'Four-stage Compressor';
+  
+  // Mode parameters
+  let mode = 'orbit'; // 'orbit' or 'draw'
+  let drawStartPoint = new THREE.Vector3();
+  let isDrawingBox = false;
+
+  // Raycasting
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+
+  function init() {
+    const canvas = document.getElementById('canvas3d');
+    const container = canvas.parentElement;
+    
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(40, container.clientWidth / container.clientHeight, 1, 100000);
+    camera.position.set(0, 800, 2000);
+
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+
+    // Lighting
+    scene.add(new THREE.AmbientLight(0xffffff, 0.95));
+    const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.8);
+    dirLight1.position.set(1000, 1500, 1200);
+    dirLight1.castShadow = true;
+    dirLight1.shadow.mapSize.width = 4096;
+    dirLight1.shadow.mapSize.height = 4096;
+    dirLight1.shadow.camera.near = 10;
+    dirLight1.shadow.camera.far = 6000;
+    dirLight1.shadow.camera.left = -1000;
+    dirLight1.shadow.camera.right = 1000;
+    dirLight1.shadow.camera.top = 1000;
+    dirLight1.shadow.camera.bottom = -1000;
+    dirLight1.shadow.bias = -0.0002;
+    scene.add(dirLight1);
+
+    const dirLight2 = new THREE.DirectionalLight(0xaaccff, 0.8);
+    dirLight2.position.set(-1000, -1500, -1200);
+    scene.add(dirLight2);
+
+    // Bounding Box Visualizer Mesh
+    const boxGeo = new THREE.BoxGeometry(1, 1, 1); // 1x1x1 unit box that we scale
+    const boxMat = new THREE.MeshBasicMaterial({
+      color: 0xf5d442,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.75,
+      depthWrite: false
+    });
+    previewBox = new THREE.Mesh(boxGeo, boxMat);
+    previewBox.position.set(0, 0, 0);
+    previewBox.scale.set(150, 150, 150);
+    scene.add(previewBox);
+
+    // Bounding Box Solid Center Point
+    const markerGeo = new THREE.SphereGeometry(6, 16, 16);
+    const markerMat = new THREE.MeshBasicMaterial({ color: 0xe2564f, depthWrite: false });
+    const centerMarker = new THREE.Mesh(markerGeo, markerMat);
+    previewBox.add(centerMarker); // Relative to box center
+
+    // Load Model
+    const loader = new THREE.GLTFLoader();
+    loader.load('./models/Turbojet Engine.gltf', (gltf) => {
+      model = gltf.scene;
+      model.scale.set(1.5, 1.5, 1.5);
+      model.traverse(obj => {
+        if(obj.isMesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+          if(obj.material) {
+            obj.material.metalness = 0.35;
+            obj.material.roughness = 0.55;
+            obj.material.side = THREE.DoubleSide;
+          }
+        }
+      });
+      model.updateMatrixWorld(true); // Force matrix update immediately after load
+      scene.add(model);
+      logStatus("Successfully loaded Turbojet Engine model!");
+    }, undefined, (err) => {
+      logStatus("Error loading GLTF model. Server fallback activated.");
+      // Build a basic cylinder as fallback
+      const cylinder = new THREE.Mesh(new THREE.CylinderGeometry(150, 150, 800, 32), new THREE.MeshStandardMaterial({ color: 0x5a6472, wireframe: true }));
+      cylinder.rotation.z = Math.PI / 2;
+      scene.add(cylinder);
+      model = cylinder;
+    });
+
+    // Resize Event
+    window.addEventListener('resize', () => {
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    });
+
+    // Mode Button Handlers
+    document.getElementById('mode-orbit').addEventListener('click', () => {
+      setMode('orbit');
+    });
+    document.getElementById('mode-draw').addEventListener('click', () => {
+      setMode('draw');
+    });
+
+    function setMode(newMode) {
+      mode = newMode;
+      document.getElementById('mode-orbit').classList.toggle('active', mode === 'orbit');
+      document.getElementById('mode-draw').classList.toggle('active', mode === 'draw');
+      controls.enabled = (mode === 'orbit');
+      
+      const hintEl = document.querySelector('.hud-hint');
+      if (mode === 'orbit') {
+        hintEl.innerHTML = "Orbit Mode: Drag to rotate camera &nbsp;·&nbsp; Click to set box center";
+      } else {
+        hintEl.innerHTML = "Draw Mode: <b>Click &amp; Drag</b> on the 3D model to draw a box dynamically";
+      }
+      
+      logStatus(`Switched to ${mode.toUpperCase()} mode.`);
+    }
+
+    // Pick Event on Mouse Click
+    let isMouseDown = false, clickStartPos = { x: 0, y: 0 };
+    
+    canvas.addEventListener('mousedown', (e) => {
+      if (mode === 'draw') {
+        const rect = canvas.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        raycaster.setFromCamera(mouse, camera);
+        if (model) {
+          const intersects = raycaster.intersectObjects([model], true);
+          if (intersects.length > 0) {
+            drawStartPoint.copy(intersects[0].point);
+            isDrawingBox = true;
+            resetOffsets();
+            logStatus("Drawing box: drag mouse across the component...");
+          }
+        }
+      } else {
+        isMouseDown = true;
+        clickStartPos = { x: e.clientX, y: e.clientY };
+      }
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (mode === 'draw' && isDrawingBox) {
+        const rect = canvas.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        raycaster.setFromCamera(mouse, camera);
+        if (model) {
+          const intersects = raycaster.intersectObjects([model], true);
+          if (intersects.length > 0) {
+            const p2 = intersects[0].point;
+            
+            // Calculate midpoint center
+            clickedPoint.set(
+              (drawStartPoint.x + p2.x) / 2,
+              (drawStartPoint.y + p2.y) / 2,
+              (drawStartPoint.z + p2.z) / 2
+            );
+            
+            // Calculate bounding dimensions
+            boxSizeW = Math.max(10, Math.round(Math.abs(p2.x - drawStartPoint.x)));
+            boxSizeH = Math.max(10, Math.round(Math.abs(p2.y - drawStartPoint.y)));
+            boxSizeD = Math.max(10, Math.round(Math.abs(p2.z - drawStartPoint.z)));
+            
+            // Update UI slider values
+            updateSliderVal('size-w', boxSizeW);
+            updateSliderVal('size-h', boxSizeH);
+            updateSliderVal('size-d', boxSizeD);
+            
+            updateBoxTransform();
+          }
+        }
+      }
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      if (mode === 'draw' && isDrawingBox) {
+        isDrawingBox = false;
+        logStatus(`Completed box drawing: Center: ${document.getElementById('out-center').textContent}, Size: ${document.getElementById('out-size').textContent}`);
+      } else if (mode === 'orbit') {
+        if (isMouseDown && Math.hypot(e.clientX - clickStartPos.x, e.clientY - clickStartPos.y) < 4) {
+          const rect = canvas.getBoundingClientRect();
+          mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+          raycaster.setFromCamera(mouse, camera);
+          if (model) {
+            const intersects = raycaster.intersectObjects([model], true);
+            if (intersects.length > 0) {
+              clickedPoint.copy(intersects[0].point);
+              resetOffsets();
+              updateBoxTransform();
+              logStatus(`Set box center: [${Math.round(clickedPoint.x)}, ${Math.round(clickedPoint.y)}, ${Math.round(clickedPoint.z)}]`);
+            }
+          }
+        }
+      }
+      isMouseDown = false;
+    });
+
+    // Listeners for Sidebar Inputs
+    document.getElementById('box-key').addEventListener('input', (e) => {
+      activeKey = e.target.value;
+      // Provide appropriate default size/desc for that key
+      const defaults = {
+        inlet: { size: [320, 500, 500], desc: 'Air Intake section' },
+        compressor: { size: [330, 460, 460], desc: 'Four-stage Compressor blades' },
+        combustor: { size: [180, 440, 440], desc: 'Combustion chamber' },
+        turbine: { size: [180, 440, 440], desc: 'Turbine blades' },
+        nozzle: { size: [305, 400, 400], desc: 'Exhaust nozzle' }
+      };
+      if (defaults[activeKey]) {
+        document.getElementById('box-desc').value = defaults[activeKey].desc;
+        activeDesc = defaults[activeKey].desc;
+        boxSizeW = defaults[activeKey].size[0];
+        boxSizeH = defaults[activeKey].size[1];
+        boxSizeD = defaults[activeKey].size[2];
+        document.getElementById('size-w').value = boxSizeW;
+        document.getElementById('size-h').value = boxSizeH;
+        document.getElementById('size-d').value = boxSizeD;
+        updateSliderVal('size-w', boxSizeW);
+        updateSliderVal('size-h', boxSizeH);
+        updateSliderVal('size-d', boxSizeD);
+        updateBoxTransform();
+      }
+    });
+
+    document.getElementById('box-desc').addEventListener('input', (e) => {
+      activeDesc = e.target.value;
+    });
+
+    // Bind Position Sliders
+    bindSlider('off-x', (v) => { boxOffsetX = v; updateBoxTransform(); });
+    bindSlider('off-y', (v) => { boxOffsetY = v; updateBoxTransform(); });
+    bindSlider('off-z', (v) => { boxOffsetZ = v; updateBoxTransform(); });
+
+    // Bind Size Sliders
+    bindSlider('size-w', (v) => { boxSizeW = v; updateBoxTransform(); });
+    bindSlider('size-h', (v) => { boxSizeH = v; updateBoxTransform(); });
+    bindSlider('size-d', (v) => { boxSizeD = v; updateBoxTransform(); });
+
+    // Bind Save Button
+    document.getElementById('save-btn').addEventListener('click', saveActiveLabel);
+
+    loadSavedLabels();
+    animate();
+  }
+
+  function bindSlider(id, callback) {
+    const el = document.getElementById(id);
+    el.addEventListener('input', (e) => {
+      const val = parseInt(e.target.value);
+      document.getElementById(`val-${id}`).textContent = val;
+      callback(val);
+    });
+  }
+
+  function updateSliderVal(id, val) {
+    document.getElementById(id).value = val;
+    document.getElementById(`val-${id}`).textContent = val;
+  }
+
+  function resetOffsets() {
+    boxOffsetX = 0; boxOffsetY = 0; boxOffsetZ = 0;
+    updateSliderVal('off-x', 0);
+    updateSliderVal('off-y', 0);
+    updateSliderVal('off-z', 0);
+  }
+
+  function updateBoxTransform() {
+    const cx = clickedPoint.x + boxOffsetX;
+    const cy = clickedPoint.y + boxOffsetY;
+    const cz = clickedPoint.z + boxOffsetZ;
+
+    previewBox.position.set(cx, cy, cz);
+    previewBox.scale.set(boxSizeW, boxSizeH, boxSizeD);
+
+    document.getElementById('out-center').textContent = `[${Math.round(cx)}, ${Math.round(cy)}, ${Math.round(cz)}]`;
+    document.getElementById('out-size').textContent = `[${boxSizeW}, ${boxSizeH}, ${boxSizeD}]`;
+  }
+
+  function logStatus(msg) {
+    const el = document.getElementById('console-log');
+    el.textContent = msg;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function saveActiveLabel() {
+    const cx = Math.round(clickedPoint.x + boxOffsetX);
+    const cy = Math.round(clickedPoint.y + boxOffsetY);
+    const cz = Math.round(clickedPoint.z + boxOffsetZ);
+    
+    const payload = {
+      key: activeKey,
+      description: activeDesc,
+      center: [cx, cy, cz],
+      size: [boxSizeW, boxSizeH, boxSizeD]
+    };
+
+    logStatus(`Saving label '${activeKey}' to server...`);
+    
+    fetch('/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    .then(res => res.json())
+    .then(data => {
+      if (data.status === 'success') {
+        logStatus(`[SUCCESS] Saved label: ${activeKey}`);
+        loadSavedLabels(); // Refresh list
+      } else {
+        logStatus(`[ERROR] Save failed: ${data.message}`);
+      }
+    })
+    .catch(err => {
+      logStatus(`[ERROR] Connection failed: ${err.message}`);
+    });
+  }
+
+  function loadSavedLabels() {
+    // Load from engine_labels.json served by python
+    fetch('./engine_labels.json?t=' + Date.now())
+    .then(res => {
+      if (!res.ok) throw new Error("File not found");
+      return res.json();
+    })
+    .then(labels => {
+      const container = document.getElementById('saved-list');
+      container.innerHTML = '';
+      if (labels.length === 0) {
+        container.innerHTML = '<div style="font-size:11px; color:var(--ink-faint)">No boxes saved yet.</div>';
+        return;
+      }
+      labels.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'saved-item';
+        row.style.cursor = 'pointer';
+        
+        let isEditing = false;
+        
+        function renderContent() {
+          if (isEditing) {
+            row.innerHTML = `
+              <div style="display: flex; align-items: center; gap: 8px; width: 100%;" onclick="event.stopPropagation();">
+                <input type="text" class="rename-input" value="${item.key}" style="flex: 1; padding: 4px 8px; font-size: 11.5px; background: rgba(0,0,0,0.2); border: 1px solid var(--accent); border-radius: 4px; color: var(--ink);">
+                <button class="action-btn btn-save" title="Save Rename" style="color: var(--teal);">
+                  <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="20 6 9 17 4 12"></polyline>
+                  </svg>
+                </button>
+                <button class="action-btn btn-cancel" title="Cancel" style="color: var(--ink-dim);">
+                  <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                  </svg>
+                </button>
+              </div>
+            `;
+            
+            const input = row.querySelector('.rename-input');
+            input.focus();
+            input.select();
+            
+            input.addEventListener('keydown', (e) => {
+              if (e.key === 'Enter') {
+                saveRename();
+              } else if (e.key === 'Escape') {
+                isEditing = false;
+                renderContent();
+              }
+            });
+            
+            row.querySelector('.btn-save').addEventListener('click', (e) => {
+              e.stopPropagation();
+              saveRename();
+            });
+            
+            row.querySelector('.btn-cancel').addEventListener('click', (e) => {
+              e.stopPropagation();
+              isEditing = false;
+              renderContent();
+            });
+            
+          } else {
+            row.innerHTML = `
+              <div style="flex: 1; min-width: 0;">
+                <span style="font-weight: 600; color: var(--cyan);">${item.key}</span>${item.description ? `: ${item.description}` : ''}
+                <div style="font-size: 9px; color: var(--ink-faint); margin-top: 2px;">
+                  C: [${item.center.join(', ')}] &nbsp;·&nbsp; S: [${item.size.join(', ')}]
+                </div>
+              </div>
+              <div style="display: flex; gap: 4px;" onclick="event.stopPropagation();">
+                <button class="action-btn btn-rename" title="Rename Bounding Box">
+                  <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                    <path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4z"></path>
+                  </svg>
+                </button>
+                <button class="action-btn btn-delete" title="Delete Bounding Box">
+                  <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="3 6 5 6 21 6"></polyline>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                  </svg>
+                </button>
+              </div>
+            `;
+            
+            row.querySelector('.btn-rename').addEventListener('click', (e) => {
+              e.stopPropagation();
+              isEditing = true;
+              renderContent();
+            });
+            
+            row.querySelector('.btn-delete').addEventListener('click', (e) => {
+              e.stopPropagation();
+              if (confirm(`Are you sure you want to delete the box label '${item.key}'?`)) {
+                deleteLabel(item.key);
+              }
+            });
+          }
+        }
+        
+        function saveRename() {
+          const newKey = row.querySelector('.rename-input').value.trim();
+          if (!newKey) {
+            alert("Name cannot be empty.");
+            return;
+          }
+          if (newKey === item.key) {
+            isEditing = false;
+            renderContent();
+            return;
+          }
+          
+          logStatus(`Renaming label '${item.key}' to '${newKey}'...`);
+          
+          fetch('/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ oldKey: item.key, newKey: newKey })
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.status === 'success') {
+              logStatus(`[SUCCESS] Renamed label: '${item.key}' -> '${newKey}'`);
+              loadSavedLabels();
+            } else {
+              logStatus(`[ERROR] Rename failed: ${data.message}`);
+              alert(`Rename failed: ${data.message}`);
+            }
+          })
+          .catch(err => {
+            logStatus(`[ERROR] Connection failed: ${err.message}`);
+            alert(`Connection failed: ${err.message}`);
+          });
+        }
+        
+        function deleteLabel(key) {
+          logStatus(`Deleting label '${key}'...`);
+          
+          fetch('/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: key })
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.status === 'success') {
+              logStatus(`[SUCCESS] Deleted label: ${key}`);
+              loadSavedLabels();
+            } else {
+              logStatus(`[ERROR] Delete failed: ${data.message}`);
+            }
+          })
+          .catch(err => {
+            logStatus(`[ERROR] Connection failed: ${err.message}`);
+          });
+        }
+        
+        row.addEventListener('click', () => {
+          if (isEditing) return;
+          
+          activeKey = item.key;
+          document.getElementById('box-key').value = item.key;
+          document.getElementById('box-desc').value = item.description;
+          activeDesc = item.description;
+          
+          clickedPoint.set(item.center[0], item.center[1], item.center[2]);
+          resetOffsets();
+          
+          boxSizeW = item.size[0];
+          boxSizeH = item.size[1];
+          boxSizeD = item.size[2];
+          updateSliderVal('size-w', boxSizeW);
+          updateSliderVal('size-h', boxSizeH);
+          updateSliderVal('size-d', boxSizeD);
+          
+          updateBoxTransform();
+          logStatus(`Loaded saved box '${item.key}' into controls.`);
+        });
+        
+        renderContent();
+        container.appendChild(row);
+      });
+    })
+    .catch(err => {
+      // Ignored if file doesn't exist yet
+      document.getElementById('saved-list').innerHTML = '<div style="font-size:11px; color:var(--ink-faint)">No boxes saved yet.</div>';
+    });
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+
+  window.onload = init;
+</script>
+</body>
+</html>
