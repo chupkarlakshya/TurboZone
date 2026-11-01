@@ -34,6 +34,7 @@ const S = {
   cache: new Map(), explained: new Map(), playing: null, explainSeq: 0,
   user: localStorage.getItem('gz_user') || '',
   notified: new Set(), critical: {}, sound: localStorage.getItem('gz_sound') !== 'off',
+  qLevels: new Set(), qText: '',
 };
 
 /* ------------------------------------------------------------------ helpers */
@@ -66,7 +67,7 @@ function glyph(level, size = 12) {
   return `<svg viewBox="0 0 ${s} ${s}" width="${s}" height="${s}" aria-hidden="true">${shape}</svg>`;
 }
 const chip = (level, label, extra = '') =>
-  `<span class="chip" style="border-color:${LEVEL_FILL[level]}">${glyph(level)}<span style="color:${LEVEL_INK[level]}">${esc(label)}</span>${extra ? ` <small>${esc(extra)}</small>` : ''}</span>`;
+  `<span class="chip${level >= 2 ? ' pulse' : ''}" style="border-color:${LEVEL_FILL[level]}">${glyph(level)}<span style="color:${LEVEL_INK[level]}">${esc(label)}</span>${extra ? ` <small>${esc(extra)}</small>` : ''}</span>`;
 
 const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -138,19 +139,78 @@ function triage(i = S.i) {
 async function loadFleet() {
   const fl = await api('/api/fleet?as_of=' + S.asOf);
   S.fleet = fl.engines; S.enums = fl.enums;
-  renderQueue();
+  renderBoard(); renderQueue();
+}
+
+function renderBoard() {
+  const counts = [0, 0, 0, 0];
+  S.fleet.forEach(e => counts[e.urgency]++);
+  const total = S.fleet.length || 1;
+  $('#fleet-board').innerHTML = `
+    <div class="fb-head"><h2>Fleet queue</h2><span>${S.fleet.length} engines, most urgent first</span></div>
+    <div class="fb-bar" role="img" aria-label="${counts.map((n, k) => `${n} ${LEVELS[k]}`).join(', ')}">
+      ${[3, 2, 1, 0].map(k => counts[k] ? `<i style="flex:${counts[k] / total};background:${LEVEL_FILL[k]}" title="${counts[k]} ${LEVELS[k]}"></i>` : '').join('')}</div>
+    <div class="fb-legend" role="group" aria-label="Show only">
+      ${[3, 2, 1, 0].map(k => `<button data-level="${k}" aria-pressed="${S.qLevels.has(k)}" ${counts[k] ? '' : 'disabled'}
+        title="Show only ${LEVELS[k]} engines">${glyph(k, 10)}<b>${counts[k]}</b><span>${LEVELS[k]}</span></button>`).join('')}</div>`;
+  $('#fleet-board').querySelectorAll('[data-level]').forEach(btn => btn.addEventListener('click', () => {
+    const k = +btn.dataset.level;
+    S.qLevels.has(k) ? S.qLevels.delete(k) : S.qLevels.add(k);
+    renderBoard(); renderQueue();
+  }));
 }
 
 function renderQueue() {
   const before = flipCapture(document.querySelectorAll('#queue button[data-id]'), 'id');
+  const text = S.qText.trim().toLowerCase();
+  const shown = S.fleet.map((e, rank) => ({ e, rank })).filter(({ e }) =>
+    (!S.qLevels.size || S.qLevels.has(e.urgency)) &&
+    (!text || String(e.engine_id).toLowerCase().includes(text) || String(e.dataset || e.source || '').toLowerCase().includes(text)));
+  const short = d => String(d || 'Upload').replace(/-\d+$/, '');
   // only the three most urgent Emergency engines pulse: a pulse is a signal only while it is rare
-  $('#queue').innerHTML = S.fleet.map((e, k) => `<li><button data-id="${esc(e.engine_id)}" aria-current="${e.engine_id === S.id}" class="u${e.urgency}${e.urgency === 3 && k < 3 ? ' pulse' : ''}" style="--u:${LEVEL_FILL[e.urgency]}">
-    <span class="q-glyph">${glyph(e.urgency, 14)}</span>
-    <span class="q-id">${esc(e.engine_id)} <span class="sr-only">${esc(LEVELS[e.urgency])}</span></span>
-    <span class="q-where">${esc(e.dataset || e.source)}, ${esc(LEVELS[e.urgency]).toLowerCase()}${e.urgency_driver === 'rul' && e.urgency > e.band ? ' on RUL' : ''}, ${esc(e.localisation.replace(' (not separable by the EKF)', ''))}</span>
-    <span class="q-rul"><b>${fi(e.planning_rul)}</b><span>flights</span></span></button></li>`).join('');
+  $('#queue').innerHTML = shown.map(({ e, rank }) => {
+    const used = ok(e.rul) && e.last_cycle ? clamp(e.last_cycle / (e.last_cycle + Math.max(0, e.rul)), 0, 1) : null;
+    const where = e.localisation.replace(' (not separable by the EKF)', '');
+    const why = e.urgency_driver === 'rul' && e.urgency > e.band ? 'Urgency set by the planning RUL' : 'Urgency set by component health';
+    const tip = `${LEVELS[e.urgency]}. ${why}. Flight ${e.last_cycle}` + (used != null ? `, about ${Math.round(used * 100)}% of estimated life used.` : '.');
+    return `<li><button data-id="${esc(e.engine_id)}" aria-current="${e.engine_id === S.id}" class="u${e.urgency}${e.urgency === 3 && rank < 3 ? ' pulse' : ''}" style="--u:${LEVEL_FILL[e.urgency]}" title="${esc(tip)}">
+      <span class="q-glyph">${glyph(e.urgency, 14)}</span>
+      <span class="q-id">${esc(e.engine_id)}<span class="q-sub">${esc(short(e.dataset || e.source))}</span><span class="sr-only">${esc(LEVELS[e.urgency])}</span></span>
+      <span class="q-where">${esc(where)} most worn</span>
+      <span class="q-rul"><b>${fi(e.planning_rul)}</b><span>flights</span></span>
+      <span class="q-life" aria-hidden="true"><i style="width:${used == null ? 0 : (used * 100).toFixed(1)}%"></i></span></button></li>`;
+  }).join('') || `<li class="q-empty"><p>No engines match.</p><button class="rail-link" id="q-clear">Clear the filters</button></li>`;
+  const clear = $('#q-clear');
+  if (clear) clear.addEventListener('click', () => { S.qLevels.clear(); S.qText = ''; $('#q-search').value = ''; renderBoard(); renderQueue(); });
   flipPlay(document.querySelectorAll('#queue button[data-id]'), 'id', before);
 }
+
+/* retractable rail: full panel <-> slim strip; remembered; '[' toggles */
+function setRail(mini, animate = true) {
+  const app = $('#app'), rail = $('#rail'), btn = $('#rail-toggle');
+  const apply = () => {
+    app.classList.toggle('rail-mini', mini);
+    btn.setAttribute('aria-expanded', String(!mini));
+    btn.title = mini ? 'Expand the fleet panel ( [ )' : 'Collapse the fleet panel ( [ )';
+    btn.setAttribute('aria-label', mini ? 'Expand the fleet panel' : 'Collapse the fleet panel');
+    localStorage.setItem('gz_rail', mini ? 'mini' : 'full');
+  };
+  if (!animate || reduceMotion()) { apply(); dispatchEvent(new Event('resize')); return; }
+  rail.classList.add('switching');                     // fade the contents out, swap layout, fade back in
+  setTimeout(() => { apply(); rail.classList.remove('switching'); }, 140);
+  setTimeout(() => dispatchEvent(new Event('resize')), 560);   // charts and the 3D view redraw at the new width
+}
+$('#rail-toggle').addEventListener('click', () => setRail(!$('#app').classList.contains('rail-mini')));
+document.addEventListener('keydown', ev => {
+  if (ev.key === '[' && !ev.target.closest('input, select, textarea')) { ev.preventDefault(); setRail(!$('#app').classList.contains('rail-mini')); }
+});
+setRail(localStorage.getItem('gz_rail') === 'mini', false);
+
+$('#q-search').addEventListener('input', ev => { S.qText = ev.target.value; renderQueue(); });
+$('#q-search').addEventListener('keydown', ev => { if (ev.key === 'Escape') { ev.target.value = ''; S.qText = ''; renderQueue(); ev.target.blur(); } });
+document.addEventListener('keydown', ev => {
+  if (ev.key === '/' && !ev.target.closest('input, select, textarea')) { ev.preventDefault(); $('#q-search').focus(); }
+});
 
 $('#queue').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-id]');
@@ -160,7 +220,9 @@ $('#queue').addEventListener('click', ev => {
 });
 
 const asOf = $('#asof');
-asOf.addEventListener('input', () => { $('#asof-v').textContent = asOf.value + '%'; });
+const paintAsOf = () => { asOf.style.setProperty('--p', ((asOf.value - asOf.min) / (asOf.max - asOf.min) * 100) + '%'); };
+paintAsOf();
+asOf.addEventListener('input', () => { $('#asof-v').textContent = asOf.value + '%'; paintAsOf(); });
 asOf.addEventListener('change', async () => {
   S.asOf = +asOf.value / 100;
   await loadFleet();
@@ -171,25 +233,29 @@ asOf.addEventListener('change', async () => {
 function renderModelCard() {
   const m = S.model || {}, mt = m.metrics || {}, rs = mt.rul_stack || {}, iv = m.interval || {};
   const built = ((m.build || {}).trained_utc || '').slice(0, 10);
+  const d = built ? new Date(built + 'T00:00:00Z').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }) : '';
   $('#model-card').innerHTML = `
-    <p>Model trained ${esc(built)} on ${(m.files || []).length} N-CMAPSS subsets, checked on ${mt.test_engines || '?'} engines it never saw.</p>
-    <p>Typical RUL error <strong>±${fx(rs.rmse, 1)} flights</strong>. The 90% range held on <strong>${fx((iv.coverage_test || 0) * 100, 0)}%</strong> of test flights.</p>
-    <button class="rail-btn" id="upload">Analyse a CSV of flights</button>
-    <a class="rail-btn" href="legacy.html">Previous dashboard</a>`;
+    <div class="mc-stats">
+      <div><b>±${fx(rs.rmse, 1)}</b><span>flights typical RUL error</span></div>
+      <div><b>${fx((iv.coverage_test || 0) * 100, 0)}%</b><span>of test flights inside the 90% range</span></div>
+    </div>
+    <p class="mc-note">Trained ${esc(d)} on ${(m.files || []).length} N-CMAPSS subsets, tested on ${mt.test_engines || '?'} engines it never saw.</p>
+    <button class="rail-cta" id="upload"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V2.5M4.5 6 8 2.5 11.5 6M2.5 10.5v3h11v-3"/></svg><span>Analyse a CSV of flights</span></button>
+    <a class="rail-link" href="legacy.html">Open the previous dashboard</a>`;
   const input = Object.assign(document.createElement('input'), { type: 'file', accept: '.csv', hidden: true });
   document.body.appendChild(input);
   $('#upload').addEventListener('click', () => input.click());
   input.addEventListener('change', async () => {
     if (!input.files.length) return;
     const fd = new FormData(); fd.append('file', input.files[0]);
-    $('#upload').textContent = 'Analysing…';
+    $('#upload span').textContent = 'Analysing…'; $('#upload').disabled = true;
     try {
       const body = await api('/api/analyze', { method: 'POST', body: fd });
       await loadFleet();
       const first = Object.keys(body.engines)[0];
       if (first) selectEngine(first, null);
     } catch (e) { alert('The CSV could not be analysed: ' + e.message); }
-    finally { $('#upload').textContent = 'Analyse a CSV of flights'; input.value = ''; }
+    finally { $('#upload span').textContent = 'Analyse a CSV of flights'; $('#upload').disabled = false; input.value = ''; }
   });
 }
 
@@ -388,11 +454,13 @@ $('#flight').addEventListener('change', () => {
 $('#play').addEventListener('click', () => (S.playing ? stopPlay() : startPlay()));
 function startPlay() {
   if (S.i >= S.n - 1) setCursor(0);
+  $('#play').classList.add('playing');
   $('#play-ico').innerHTML = '<path d="M4 3h3v10H4zM9 3h3v10H9z"/>';
   S.playing = setInterval(() => { if (S.i >= S.n - 1) stopPlay(); else setCursor(S.i + 1); }, 160);
 }
 function stopPlay() {
   clearInterval(S.playing); S.playing = null;
+  $('#play').classList.remove('playing');
   $('#play-ico').innerHTML = '<path d="M5 3v10l8-5z"/>';
 }
 document.addEventListener('keydown', ev => {
