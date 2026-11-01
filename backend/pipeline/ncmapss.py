@@ -1,26 +1,29 @@
-"""NASA N-CMAPSS (C-MAPSS 2) digital-twin pipeline: Layers 1-3 plus feature engineering.
+"""NASA N-CMAPSS physics-informed pipeline, implemented as specified in pipeline.md.
 
-This ONE module is used by the Colab training notebook (inlined) and by the backend, so models are trained and
-served on identical computations. Dependencies: numpy, pandas (+ h5py only for reading the raw .h5 files).
+Layers (all causal per engine, one prediction per completed flight = flight-end cadence):
+  1  ingestion          inspect_h5, load_h5 (columns mapped BY NAME), validate_split, aggregate_cycles
+  2  physics            physics_1hz (pressure ratios, efficiency proxies) + HealthyReference g(W) (healthy-condition
+                        baseline) -> residual = measured / healthy - 1
+  3  state estimation   GasPathEKF: reduced-order observation model  res = b(W) + B(W) x + v,  random-walk state x,
+                        Kalman update with Joseph covariance, innovation gating; states that the sensors cannot
+                        separate are merged (observability analysis)
+  4  features           CausalFeaturizer: current values + trailing-window mean/std/min/max/slope, exposure
 
-Layer 1  load_h5 / aggregate_cycles : 1 Hz flight data -> one row per (unit, flight cycle)
-Layer 2  physics_1hz + HealthyReference : first-principles ratios/efficiency proxies, and a healthy-engine map
-         (sensor = f(flight condition)) giving the "ideal" sensor value and the residual (actual vs ideal)
-Layer 3  GasPathKF : Kalman filter on a linearised gas-path model, estimating the 10 component health
-         parameters (efficiency/flow modifiers) with uncertainty, plus per-sensor innovation checks
-Layer 4 inputs  CausalFeaturizer, build_windows : causal per-engine features for the trees;
-         downsample_1hz + SampleEncoder : 0.1 Hz in-flight sequences (+ residuals, KF states) for the CNN
-Post-processing  smooth_target : causal per-engine smoothing of predictions (RUL drops 1 per cycle)
+This ONE module is used by the Colab training notebook (inlined) and by the backend, so training and serving compute
+identical features. Dependencies: numpy, pandas (+ h5py for reading .h5 files).
 
-Conventions: health index 1.0 = healthy, 0.0 = failure-level degradation. Everything is causal per engine
-(uses only the current and earlier cycles), so the same code runs cycle by cycle in real time.
+Conventions: hidden degradation parameters `T` are used ONLY offline (labels, physics calibration, validation), never
+as online inputs; `Y` (RUL) is only a target. Health index 1.0 = healthy, 0.0 = failure-level damage of that component.
 """
 from __future__ import annotations
 
 import itertools
+import os
 
 import numpy as np
 import pandas as pd
+
+AGG_VERSION = 2          # bump when load_h5 / aggregate_cycles change: invalidates cached aggregates
 
 # ----------------------------------------------------------------------------------------------- schema
 W_VARS = ["alt", "Mach", "TRA", "T2"]
@@ -45,14 +48,14 @@ SENSOR_INFO = {   # description, kind ("T" degR, "P" psia, "N" rpm, "W" lbm/s)
     "T40": ("Burner outlet temperature (virtual)", "T"), "P30": ("HPC outlet total pressure (virtual)", "P"),
     "P45": ("HPT outlet total pressure (virtual)", "P"),
 }
+UNITS = {"alt": "ft", "Mach": "-", "TRA": "%", "T2": "degR", "T": "degR", "P": "psia", "N": "rpm", "W": "lbm/s"}
 
 GAMMA = 1.4
 K_COLD = (GAMMA - 1.0) / GAMMA
 GAMMA_HOT = 1.33
 K_HOT = (GAMMA_HOT - 1.0) / GAMMA_HOT
 
-# Physics proxies computed at 1 Hz from MEASURED signals only, and the sensors each one depends on
-# (used by the occlusion explainer).
+# Physics proxies computed at 1 Hz from MEASURED signals only, and the sensors each one depends on (occlusion explainer).
 PROXY_DEPS = {
     "fan_pr": ["P21", "P2"], "lpc_pr": ["P24", "P21"], "hpc_pr": ["Ps30", "P24"],
     "eta_core": ["P24", "P2", "T24"], "eta_hpc": ["Ps30", "P24", "T30", "T24"],
@@ -61,8 +64,8 @@ PROXY_DEPS = {
 }
 PROXIES = list(PROXY_DEPS)
 
-# Fixed (not data-fitted) centring/scaling of the flight condition, so per-cycle polynomial means can be
-# accumulated before any model is fitted.
+# Fixed (not data-fitted) centring/scaling of the flight condition, so per-cycle polynomial means can be accumulated
+# before any model is fitted.
 W_CENTER = {"alt": (20000.0, 15000.0), "Mach": (0.5, 0.25), "TRA": (60.0, 20.0), "T2": (500.0, 30.0)}
 
 DEG_R_TO_K = 5.0 / 9.0
@@ -71,48 +74,105 @@ FT_TO_M = 0.3048
 LBM_TO_KG = 0.45359237
 
 
-# ----------------------------------------------------------------------------------------------- Layer 1
+# ----------------------------------------------------------------------------------------------- Layer 1: ingestion
 def h5_names(f, key: str) -> list[str]:
     return [str(s).strip() for s in np.array(f[key]).reshape(-1).astype("U32")]
+
+
+def inspect_h5(path: str) -> dict:
+    """Keys, shapes, dtypes and attributes of an HDF5 file (pipeline.md section 2.5, step 1)."""
+    import h5py
+
+    info = {"file": os.path.basename(path), "bytes": int(os.path.getsize(path)), "datasets": {}, "groups": [],
+            "attrs": {}}
+    with h5py.File(path, "r") as f:
+        info["attrs"] = {str(k): str(v)[:200] for k, v in f.attrs.items()}
+
+        def visit(name, obj):
+            if hasattr(obj, "shape"):
+                info["datasets"][name] = {"shape": [int(d) for d in obj.shape], "dtype": str(obj.dtype)}
+            else:
+                info["groups"].append(name)
+        f.visititems(visit)
+    return info
 
 
 def load_h5(path: str, split: str = "dev", virtual=XV_DISPLAY) -> pd.DataFrame:
     """Read one split ("dev" or "test") of an N-CMAPSS .h5 file into a 1 Hz DataFrame (float32).
 
-    Columns are mapped by the variable names stored in the file (W_var, X_s_var, ...), not by position.
+    Columns are mapped by the variable names stored in the file (W_var, X_s_var, ...), never by position; the groups
+    must be row-aligned. Corrupt rows (non-finite W/X_s, sensor <= 0, unit/cycle < 1) are removed and counted in
+    df.attrs["dropped_rows"]; nothing else is altered.
     """
     import h5py
 
     with h5py.File(path, "r") as f:
-        frames = []
+        frames, lengths = [], {}
         for grp in ("W", "X_s", "T", "A"):
             names = h5_names(f, f"{grp}_var")
-            dtype = np.int32 if grp == "A" else np.float32
-            frames.append(pd.DataFrame(np.asarray(f[f"{grp}_{split}"], dtype=dtype), columns=names))
-        frames.append(pd.DataFrame({"RUL": np.asarray(f[f"Y_{split}"], dtype=np.float32).reshape(-1)}))
+            arr = np.asarray(f[f"{grp}_{split}"], dtype=np.int32 if grp == "A" else np.float32)
+            if arr.ndim != 2 or arr.shape[1] != len(names):
+                raise ValueError(f"{path} [{split}]: {grp} has shape {arr.shape} but {len(names)} variable names")
+            lengths[grp] = arr.shape[0]
+            frames.append(pd.DataFrame(arr, columns=names))
+        y = np.asarray(f[f"Y_{split}"], dtype=np.float32).reshape(-1)
+        lengths["Y"] = len(y)
+        frames.append(pd.DataFrame({"RUL": y}))
         if virtual and f"X_v_{split}" in f:
             vnames = h5_names(f, "X_v_var")
-            keep = [vnames.index(v) for v in virtual if v in vnames]
+            keep = sorted(vnames.index(v) for v in virtual if v in vnames)
             if keep:
-                arr = np.asarray(f[f"X_v_{split}"][:, sorted(keep)], dtype=np.float32)
-                frames.append(pd.DataFrame(arr, columns=["v_" + vnames[i] for i in sorted(keep)]))
+                arr = np.asarray(f[f"X_v_{split}"][:, keep], dtype=np.float32)
+                lengths["X_v"] = arr.shape[0]
+                frames.append(pd.DataFrame(arr, columns=["v_" + vnames[i] for i in keep]))
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"{path} [{split}]: groups are not row-aligned: {lengths}")
     df = pd.concat(frames, axis=1)
     missing = [c for c in W_VARS + XS_VARS + ["unit", "cycle"] if c not in df.columns]
     if missing:
         raise ValueError(f"{path} [{split}] is missing variables {missing}")
-    # physically impossible rows (e.g. zero-filled bytes of a repaired truncated file): sensors are always > 0
-    bad = (df[XS_VARS].to_numpy() <= 0).any(axis=1) | (df["unit"].to_numpy() < 1) | (df["cycle"].to_numpy() < 1)
+    ws = df[W_VARS + XS_VARS].to_numpy()
+    bad = ~np.isfinite(ws).all(axis=1) | (df[XS_VARS].to_numpy() <= 0).any(axis=1) | \
+        (df["unit"].to_numpy() < 1) | (df["cycle"].to_numpy() < 1)
     if bad.any():
         df = df.loc[~bad].reset_index(drop=True)
     df.attrs["dropped_rows"] = int(bad.sum())
     return df
 
 
+def validate_split(df: pd.DataFrame, split: str = "dev") -> dict:
+    """Schema/ordering/label checks of a loaded split (pipeline.md section 2.5, steps 3-7).
+
+    Raises ValueError for violations the pipeline depends on (engine rows not contiguous, cycles going backwards);
+    everything else is reported (e.g. RUL not monotone, missing values) so it can be inspected in the bundle.
+    """
+    u, c = df["unit"].to_numpy(), df["cycle"].to_numpy()
+    same = u[1:] == u[:-1]
+    contiguous = len(np.unique(u)) == 1 + int(np.count_nonzero(~same))
+    monotone = bool(np.all(c[1:][same] >= c[:-1][same]))
+    if not contiguous:
+        raise ValueError(f"[{split}] rows of an engine are not contiguous")
+    if not monotone:
+        raise ValueError(f"[{split}] cycle numbers go backwards within an engine")
+    rep = {"split": split, "rows_1hz": int(len(df)), "engines": int(len(np.unique(u))),
+           "dropped_rows": int(df.attrs.get("dropped_rows", 0)), "units": sorted(int(v) for v in np.unique(u))}
+    if "RUL" in df:
+        y = df["RUL"].to_numpy()
+        rep["rul_non_increasing_within_engine"] = not bool(np.any(same & (y[1:] > y[:-1] + 1e-6)))
+        rep["rul_min"], rep["rul_max"] = float(np.nanmin(y)), float(np.nanmax(y))
+    if "hs" in df:
+        rep["hs_values"] = sorted(int(v) for v in np.unique(df["hs"]))
+    na = df.isna().sum()
+    rep["missing_values"] = {k: int(v) for k, v in na.items() if v}
+    rep["sensor_range"] = {s: [float(df[s].min()), float(df[s].max())] for s in XS_VARS}
+    rep["condition_range"] = {w: [float(df[w].min()), float(df[w].max())] for w in W_VARS}
+    return rep
+
+
 def repair_truncated_h5(path: str, workdir: str, max_missing: int = 4096):
-    """Some mirrors ship an .h5 a few bytes shorter than its header records (Kaggle's DS08d-010: 32 bytes), which
-    HDF5 refuses to open. Copy it to `workdir` and zero-pad the copy up to the recorded size (load_h5 then drops any
-    zeroed rows). Returns (path to open, repaired copy to delete afterwards or None)."""
-    import os
+    """Some mirrors ship an .h5 a few bytes shorter than its header records (Kaggle's DS08d-010: 32 bytes), which HDF5
+    refuses to open. Copy it to `workdir` and zero-pad the copy up to the recorded size (load_h5 then drops any zeroed
+    rows). Returns (path to open, repaired copy to delete afterwards or None)."""
     import re
     import shutil
 
@@ -136,8 +196,8 @@ def repair_truncated_h5(path: str, workdir: str, max_missing: int = 4096):
 def physics_1hz(df: pd.DataFrame) -> pd.DataFrame:
     """First-principles ratios from measured signals (unit-free; temperatures in degR, pressures in psia).
 
-    Efficiencies are isentropic PROXIES: eta_core spans fan-hub + LPC (T2,P2 -> T24,P24); eta_hpc uses the
-    measured static Ps30 because total P30 is not measured.
+    Efficiencies are isentropic PROXIES (pipeline.md 4.3): eta_core spans fan-hub + LPC (T2,P2 -> T24,P24); eta_hpc uses
+    the measured static Ps30 because total P30 is not measured. No station is invented.
     """
     def ratio(a, b):
         b = np.asarray(b, dtype=np.float64)
@@ -184,87 +244,89 @@ def poly_features(z: np.ndarray, degree: int = 3) -> np.ndarray:
     return np.column_stack(cols)
 
 
-def aggregate_cycles(df: pd.DataFrame, degree: int = 3) -> pd.DataFrame:
-    """Collapse 1 Hz rows into one row per (unit, cycle).
+SUMMARY_PREFIXES = ("m_", "sd_", "mn_", "mx_", "ls_")   # flight mean, std, min, max, last value of each sensor
 
-    Stores per-cycle means of sensors (m_*), their std (sd_*), physics proxies (p_*), virtual sensors (v_*),
-    flight descriptors, labels (RUL, health parameters, hs) and the mean polynomial features of the flight
-    condition (phi_*). Because the healthy reference is linear in phi, mean(reference) = coef . mean(phi),
-    which gives exact per-cycle "ideal" sensor means without a second pass over the 1 Hz data.
+
+def aggregate_cycles(df: pd.DataFrame, degree: int = 3) -> pd.DataFrame:
+    """Collapse 1 Hz rows into one row per (unit, flight cycle) - the flight-end cadence of pipeline.md 3.2.
+
+    Per sensor: mean (m_), std (sd_), min (mn_), max (mx_) and last value (ls_). Also: physics-proxy means (p_),
+    virtual-sensor means (v_, display only), flight descriptors, labels (rul, health parameters, hs) and the mean
+    polynomial features of the flight condition (phi_). Because the healthy reference is linear in phi,
+    mean(reference) = coef . mean(phi), which gives exact per-flight "healthy" sensor means without a second pass.
+    Rows of a flight must be contiguous and in time order (checked by validate_split); flights are never mixed.
     """
     out = []
     vcols = [c for c in df.columns if c.startswith("v_")]
     tcols = [c for c in T_VARS if c in df.columns]
     for unit, part in df.groupby("unit", sort=True):
-        _, inv = np.unique(part["cycle"].to_numpy(), return_inverse=True)
-        cnt = np.bincount(inv).astype(np.float64)
+        cyc = part["cycle"].to_numpy()
+        if np.any(np.diff(cyc) < 0):
+            part = part.sort_values("cycle", kind="stable")
+            cyc = part["cycle"].to_numpy()
+        change = np.flatnonzero(np.diff(cyc) != 0) + 1
+        starts = np.concatenate([[0], change]).astype(np.int64)
+        ends = np.concatenate([change, [len(part)]]).astype(np.int64) - 1
+        cnt = (ends - starts + 1).astype(np.float64)
 
-        def gmean(a):
-            """NaN-aware per-cycle mean."""
-            a = np.asarray(a, dtype=np.float64)
-            a = a.reshape(len(a), -1)
+        def rmean(a):
+            a = np.asarray(a, dtype=np.float64).reshape(len(part), -1)
             ok = np.isfinite(a)
-            sums = np.column_stack([np.bincount(inv, weights=np.where(ok[:, j], a[:, j], 0.0), minlength=len(cnt))
-                                    for j in range(a.shape[1])])
-            n = np.column_stack([np.bincount(inv, weights=ok[:, j].astype(float), minlength=len(cnt))
-                                 for j in range(a.shape[1])])
-            return sums / np.where(n == 0, np.nan, n)
+            s = np.add.reduceat(np.where(ok, a, 0.0), starts, axis=0)
+            n = np.add.reduceat(ok.astype(np.float64), starts, axis=0)
+            return s / np.where(n == 0, np.nan, n)
 
-        def gmax(a):
-            res = np.full(len(cnt), -np.inf)
-            np.maximum.at(res, inv, np.asarray(a, dtype=np.float64))
-            return res
+        def rmin(a):
+            return np.minimum.reduceat(np.asarray(a, dtype=np.float64), starts, axis=0)
 
-        def gmin(a):
-            res = np.full(len(cnt), np.inf)
-            np.minimum.at(res, inv, np.asarray(a, dtype=np.float64))
-            return res
+        def rmax(a):
+            return np.maximum.reduceat(np.asarray(a, dtype=np.float64), starts, axis=0)
 
-        rows = {"unit": np.full(len(cnt), int(unit)), "cycle": gmin(part["cycle"]).astype(int),
-                "duration_s": cnt}
+        rows = {"unit": np.full(len(starts), int(unit)), "cycle": cyc[starts].astype(int), "duration_s": cnt}
         if "Fc" in part:
-            rows["fc"] = gmin(part["Fc"]).astype(int)
+            rows["fc"] = part["Fc"].to_numpy()[starts].astype(int)
         if "hs" in part:
-            rows["hs"] = gmin(part["hs"]).astype(int)
+            rows["hs"] = rmin(part["hs"].to_numpy()).astype(int)
         if "RUL" in part:
-            rows["rul"] = gmin(part["RUL"])
+            rows["rul"] = rmin(part["RUL"].to_numpy())
         w = part[W_VARS].to_numpy(dtype=np.float64)
-        wm = gmean(w)
+        wm = rmean(w)
         for j, v in enumerate(W_VARS):
             rows[f"{v}_mean"] = wm[:, j]
-        rows["alt_max"] = gmax(part["alt"])
-        rows["Mach_max"] = gmax(part["Mach"])
+        rows["alt_max"] = rmax(part["alt"].to_numpy())
+        rows["Mach_max"] = rmax(part["Mach"].to_numpy())
         x = part[XS_VARS].to_numpy(dtype=np.float64)
-        xm, x2 = gmean(x), gmean(x ** 2)
+        xm, x2 = rmean(x), rmean(x ** 2)
+        xmin, xmax, xlast = rmin(x), rmax(x), x[ends]
         for j, s in enumerate(XS_VARS):
             rows[f"m_{s}"] = xm[:, j]
             rows[f"sd_{s}"] = np.sqrt(np.clip(x2[:, j] - xm[:, j] ** 2, 0, None))
-        pm = gmean(physics_1hz(part).to_numpy())
+            rows[f"mn_{s}"] = xmin[:, j]
+            rows[f"mx_{s}"] = xmax[:, j]
+            rows[f"ls_{s}"] = xlast[:, j]
+        pm = rmean(physics_1hz(part).to_numpy())
         for j, p in enumerate(PROXIES):
             rows[f"p_{p}"] = pm[:, j]
         if vcols:
-            vm = gmean(part[vcols].to_numpy())
+            vm = rmean(part[vcols].to_numpy())
             for j, c in enumerate(vcols):
                 rows[c] = vm[:, j]
         if tcols:
-            tm = gmean(part[tcols].to_numpy())
+            tm = rmean(part[tcols].to_numpy())
             for j, c in enumerate(tcols):
                 rows[c] = tm[:, j]
-        phim = gmean(poly_features(scaled_w(w), degree))
+        phim = rmean(poly_features(scaled_w(w), degree))
         for j in range(phim.shape[1]):
             rows[f"phi_{j}"] = phim[:, j]
         out.append(pd.DataFrame(rows))
     return pd.concat(out, ignore_index=True).sort_values(["unit", "cycle"]).reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------------------------------- Layer 2
+# ----------------------------------------------------------------------------------------------- Layer 2: physics
 class HealthyReference:
-    """Healthy-engine map: each measured sensor as a degree-3 polynomial of the flight condition (alt, Mach,
-    TRA, T2), fitted by ridge regression on healthy (hs == 1) flight data of the training engines only.
-
-    It plays the role of the diagram's "ideal performance" model: for any flight condition it predicts what a
-    healthy engine would read, so residual = actual - ideal isolates degradation from operating conditions.
-    """
+    """Healthy-condition baseline g(W) (pipeline.md 3.4 / 4.5): each measured sensor as a ridge-regularised degree-3
+    polynomial of the flight condition (alt, Mach, TRA, T2), fitted on healthy (hs == 1) rows of TRAINING engines only.
+    residual = measured / healthy - 1 removes the effect of the flight condition."""
 
     def __init__(self, degree: int = 3, alpha: float = 1e-3, sensors=XS_VARS):
         self.degree, self.alpha, self.sensors = degree, alpha, list(sensors)
@@ -298,7 +360,7 @@ class HealthyReference:
 
 
 def add_residuals(cyc: pd.DataFrame, ref: HealthyReference) -> pd.DataFrame:
-    """Add ref_<sensor> (ideal, healthy-engine value) and res_<sensor> (relative residual, actual/ideal - 1)."""
+    """Add ref_<sensor> (healthy-engine value) and res_<sensor> (relative residual, measured/healthy - 1)."""
     cyc = cyc.copy()
     phi_cols = [f"phi_{j}" for j in range(ref.coef.shape[0])]
     exp = ref.expected_from_phi(cyc[phi_cols].to_numpy())
@@ -308,147 +370,47 @@ def add_residuals(cyc: pd.DataFrame, ref: HealthyReference) -> pd.DataFrame:
     return cyc
 
 
-# ----------------------------------------------------------------------------------------------- labels
-def component_damage(df: pd.DataFrame) -> pd.DataFrame:
+def residual_by_condition(cyc: pd.DataFrame, n_bins: int = 3) -> pd.DataFrame:
+    """Healthy-phase residual mean/std per sensor by altitude band (inspect the baseline by operating range, 4.5)."""
+    h = cyc[cyc["hs"] == 1] if "hs" in cyc else cyc
+    bins = pd.qcut(h["alt_mean"], n_bins, duplicates="drop")
+    rows = []
+    for b, g in h.groupby(bins, observed=True):
+        for s in XS_VARS:
+            r = g[f"res_{s}"]
+            rows.append({"altitude_band": str(b), "sensor": s, "mean_pct": 100 * float(r.mean()),
+                         "std_pct": 100 * float(r.std()), "cycles": int(len(g))})
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------------------------- health labels / mapping
+def component_damage(df: pd.DataFrame, prefix: str = "") -> pd.DataFrame:
     """Per-component damage = larger of |efficiency modifier| and |flow modifier|."""
-    return pd.DataFrame({c: np.maximum(df[e].abs(), df[f].abs()) for c, (e, f) in COMP_THETA.items()},
+    return pd.DataFrame({c: np.maximum(df[prefix + e].abs(), df[prefix + f].abs()) for c, (e, f) in COMP_THETA.items()},
                         index=df.index)
 
 
 def fit_damage_reference(cyc_train: pd.DataFrame, q: float = 0.95, floor: float = 1e-3) -> dict:
-    """Failure-level damage PER COMPONENT: q-quantile over training engines of that component's damage at end of
-    life. One shared value would let the component with the largest modifiers (e.g. fan flow) squeeze the others,
-    so a turbine at end of life would still read ~0.8 health."""
+    """Failure-level damage per component: q-quantile over TRAINING engines of that component's damage at end of
+    life. Defines the health-index mapping HI = 1 - damage / d_ref (validated against the truth in the notebook)."""
     last = cyc_train.sort_values("cycle").groupby("unit").tail(1)
     dmg = component_damage(last)
     return {c: max(float(np.quantile(dmg[c], q)), floor) for c in COMPONENTS}
 
 
 def d_ref_of(d_ref, comp: str) -> float:
-    """d_ref may be one float (older bundles) or {component: float}."""
     return float(d_ref[comp]) if isinstance(d_ref, dict) else float(d_ref)
 
 
 def component_health(df: pd.DataFrame, d_ref) -> pd.DataFrame:
-    """HI_c = 1 - damage_c / d_ref_c, clipped to [0, 1]: fraction of failure-level degradation still unused."""
+    """TRUE health index from the hidden parameters T (offline: validation of the mapping only)."""
     dmg = component_damage(df)
     return pd.DataFrame({f"hi_{c}": (1.0 - dmg[c] / d_ref_of(d_ref, c)).clip(0.0, 1.0) for c in COMPONENTS},
                         index=df.index)
 
 
-# ----------------------------------------------------------------------------------------------- Layer 3
-SCHED_VARS = ["alt_mean", "Mach_mean", "TRA_mean"]
-
-
-def schedule(cyc: pd.DataFrame) -> np.ndarray:
-    """Operating-point variables for the influence coefficients: [1, alt, Mach, TRA] (fixed scaling)."""
-    z = [np.ones(len(cyc))]
-    for v, raw in zip(SCHED_VARS, ["alt", "Mach", "TRA"]):
-        c, s = W_CENTER[raw]
-        z.append((cyc[v].to_numpy(dtype=np.float64) - c) / s)
-    return np.column_stack(z)
-
-
-class GasPathKF:
-    """Kalman filter on a linearised gas-path model (classic gas-path analysis).
-
-    Measurement model per cycle:  res = b(w) + H(w) . theta + noise, where res are the 14 relative sensor
-    residuals, theta the 10 component health parameters and w the operating point. H(w) (influence
-    coefficients) is linear in [1, alt, Mach, TRA], i.e. the model is re-linearised at every operating point;
-    because it is linear in theta at each point, the EKF update reduces to a time-varying Kalman filter.
-    H and b are identified on training engines (where theta is known); at run time only sensors are used.
-    State model: random walk with process noise Q estimated from cycle-to-cycle theta changes.
-    """
-
-    def __init__(self, sensors=XS_VARS, theta=T_VARS, ridge: float = 1e-4, gate: float = 9.0, q_scale: float = 1.0):
-        self.sensors, self.theta = list(sensors), list(theta)
-        self.ridge, self.gate, self.q_scale = ridge, gate, q_scale
-        self.b = self.H = self.R = self.Q = self.x0 = self.P0 = None
-
-    def _design(self, z, th):
-        return np.column_stack([z] + [th[:, [p]] * z for p in range(th.shape[1])])
-
-    def fit(self, cyc: pd.DataFrame) -> "GasPathKF":
-        y = cyc[[f"res_{s}" for s in self.sensors]].to_numpy(dtype=np.float64)
-        th = cyc[self.theta].to_numpy(dtype=np.float64)
-        z = schedule(cyc)
-        x = self._design(z, th)
-        coef = np.linalg.solve(x.T @ x + self.ridge * np.eye(x.shape[1]), x.T @ y)    # (K + P*K, S)
-        k = z.shape[1]
-        self.b = coef[:k]                                                             # (K, S)
-        self.H = coef[k:].reshape(len(self.theta), k, len(self.sensors))              # (P, K, S)
-        self.R = np.var(y - x @ coef, axis=0) + 1e-12
-        cyc_sorted = cyc.sort_values(["unit", "cycle"])
-        d = cyc_sorted.groupby("unit")[self.theta].diff().dropna().to_numpy()
-        self.Q = self.q_scale * (np.var(d, axis=0) + np.mean(d, axis=0) ** 2) + 1e-12
-        first = cyc_sorted.groupby("unit")[self.theta].first().to_numpy()
-        self.x0 = first.mean(axis=0)
-        self.P0 = first.var(axis=0) + 1e-8
-        return self
-
-    def h_at(self, z_row):
-        return np.einsum("pks,k->sp", self.H, z_row), z_row @ self.b                  # (S, P), (S,)
-
-    def run(self, cyc: pd.DataFrame, res_override: np.ndarray | None = None) -> pd.DataFrame:
-        """Filter every engine causally (sorted by unit, cycle). Returns states, 1-sigma, NIS and gate flags."""
-        cyc = cyc.reset_index(drop=True)
-        res = cyc[[f"res_{s}" for s in self.sensors]].to_numpy(dtype=np.float64) if res_override is None \
-            else res_override
-        z = schedule(cyc)
-        n, p, s = len(cyc), len(self.theta), len(self.sensors)
-        xs, sig = np.zeros((n, p)), np.zeros((n, p))
-        nis, gated = np.full((n, s), np.nan), np.zeros((n, s), dtype=bool)
-        units = cyc["unit"].to_numpy()
-        for u in pd.unique(units):
-            idx = np.flatnonzero(units == u)
-            x, pm = self.x0.copy(), np.diag(self.P0)
-            consec = np.zeros(s, dtype=int)
-            for i in idx:
-                pm = pm + np.diag(self.Q)
-                h, b = self.h_at(z[i])
-                for j in range(s):
-                    r = res[i, j]
-                    if not np.isfinite(r):
-                        continue
-                    hj = h[j]
-                    innov = r - b[j] - hj @ x
-                    ph = pm @ hj
-                    sv = hj @ ph + self.R[j]
-                    nis[i, j] = innov ** 2 / sv
-                    if nis[i, j] > self.gate and consec[j] < 3:
-                        gated[i, j] = True
-                        consec[j] += 1
-                        continue
-                    consec[j] = 0
-                    kg = ph / sv
-                    x = x + kg * innov
-                    ikh = np.eye(p) - np.outer(kg, hj)
-                    pm = ikh @ pm @ ikh.T + self.R[j] * np.outer(kg, kg)           # Joseph form
-                xs[i], sig[i] = x, np.sqrt(np.clip(np.diag(pm), 0, None))
-        out = {}
-        for k_, t in enumerate(self.theta):
-            out[f"kf_{t}"] = xs[:, k_]
-            out[f"kf_{t}_sigma"] = sig[:, k_]
-        for j, sname in enumerate(self.sensors):
-            out[f"nis_{sname}"] = nis[:, j]
-            out[f"gated_{sname}"] = gated[:, j]
-        return pd.DataFrame(out)
-
-    def to_dict(self):
-        return {"sensors": self.sensors, "theta": self.theta, "ridge": self.ridge, "gate": self.gate,
-                "q_scale": self.q_scale, "sched": SCHED_VARS, "b": self.b.tolist(), "H": self.H.tolist(),
-                "R": self.R.tolist(), "Q": self.Q.tolist(), "x0": self.x0.tolist(), "P0": self.P0.tolist()}
-
-    @classmethod
-    def from_dict(cls, d):
-        k = cls(d["sensors"], d["theta"], d["ridge"], d["gate"], d["q_scale"])
-        for a in ("b", "H", "R", "Q", "x0", "P0"):
-            setattr(k, a, np.asarray(d[a], dtype=np.float64))
-        return k
-
-
 def kf_component_health(kf_out: pd.DataFrame, d_ref) -> pd.DataFrame:
-    """Component HI from the filtered health parameters, with a 1-sigma from the dominating parameter."""
+    """Health index from the EKF parameter estimates kf_<param> (online), with a 1-sigma from the dominating parameter."""
     out = {}
     for c, (e, f) in COMP_THETA.items():
         d = d_ref_of(d_ref, c)
@@ -459,265 +421,466 @@ def kf_component_health(kf_out: pd.DataFrame, d_ref) -> pd.DataFrame:
     return pd.DataFrame(out, index=kf_out.index)
 
 
-# ----------------------------------------------------------------------------------------------- Layer 4 inputs
-FLIGHT_COLS = ["alt_mean", "Mach_mean", "TRA_mean", "T2_mean", "duration_s", "fc"]
+# ----------------------------------------------------------------------------------------------- Layer 3: EKF
+SCHED_VARS = ["alt_mean", "Mach_mean", "TRA_mean"]
 
 
-def default_base_columns() -> list[str]:
-    return [f"res_{s}" for s in XS_VARS] + [f"p_{p}" for p in PROXIES] + [f"kf_{t}" for t in T_VARS]
+def schedule(cyc: pd.DataFrame) -> np.ndarray:
+    """Operating-point variables of the influence coefficients: [1, alt, Mach, TRA] (fixed scaling)."""
+    z = [np.ones(len(cyc))]
+    for v, raw in zip(SCHED_VARS, ["alt", "Mach", "TRA"]):
+        c, s = W_CENTER[raw]
+        z.append((cyc[v].to_numpy(dtype=np.float64) - c) / s)
+    return np.column_stack(z)
 
 
-def source_of(feature: str) -> str:
-    """Physical source of a model feature (for grouping SHAP values): sensor, proxy, KF state or flight."""
-    base = feature.split("__")[0]
-    for pre in ("res_", "p_", "kf_"):
-        if base.startswith(pre):
-            return base
-    return base
+def robust_var(a: np.ndarray) -> np.ndarray:
+    """Per-column robust variance (1.4826 * MAD)^2."""
+    a = np.asarray(a, dtype=np.float64)
+    med = np.nanmedian(a, axis=0)
+    return (1.4826 * np.nanmedian(np.abs(a - med), axis=0)) ** 2
 
 
-class CausalFeaturizer:
-    """Per-engine causal features: z-score, baseline-relative (vs median of the first `baseline_cycles`
-    cycles of the same engine), rolling mean and rolling slope; plus flight descriptors and cycle count."""
+def unique_shares(h: np.ndarray) -> np.ndarray:
+    """For each column of h (S, G): the share of its norm NOT explained by a least-squares fit on the other columns
+    (1 = fully separable, ~0 = a combination of the others; a zero column scores 0)."""
+    norms = np.linalg.norm(h, axis=0)
+    u = np.ones(h.shape[1])
+    if h.shape[1] == 1:
+        return u
+    for j in range(h.shape[1]):
+        others = np.delete(h, j, axis=1)
+        c, *_ = np.linalg.lstsq(others, h[:, j], rcond=None)
+        u[j] = np.linalg.norm(h[:, j] - others @ c) / max(norms[j], 1e-300) if norms[j] > 0 else 0.0
+    return u
 
-    def __init__(self, base_cols=None, baseline_cycles: int = 10, roll: int = 5, use_cycle: bool = True):
-        self.base_cols = list(base_cols) if base_cols else default_base_columns()
-        self.flight_cols = list(FLIGHT_COLS)
-        self.baseline_cycles, self.roll, self.use_cycle = baseline_cycles, roll, use_cycle
-        self.mu = self.sd = None
-        self.feature_names: list[str] = []
-        self.seq_names: list[str] = []
 
-    def fit(self, cyc: pd.DataFrame) -> "CausalFeaturizer":
-        cols = self.base_cols + self.flight_cols
-        self.mu = cyc[cols].mean().to_numpy(dtype=np.float64)
-        sd = cyc[cols].std(ddof=0).to_numpy(dtype=np.float64)
-        self.sd = np.where(sd < 1e-12, 1.0, sd)
-        self._names()
+def merge_states(hw: np.ndarray, theta: np.ndarray, merge_cos: float, min_unique: float = 0.0, active=None):
+    """Observability-driven state reduction (pipeline.md 4.2 / 4.8 step 9 / 5.4).
+
+    hw: (n_points, S, P) whitened influence matrices at sampled operating points; theta: (n, P) training values of the
+    P candidate parameters; active: indices of the parameters to consider (default all; never-excited parameters are
+    excluded by the caller). Two passes:
+      1. pairwise: merge the two groups whose sensor signatures are most similar (median |cosine| over operating points)
+         while that similarity is >= merge_cos;
+      2. joint: while some group's signature is mostly a combination of the others (median unique share < min_unique),
+         merge that group with the group it is most similar to.
+    A merged state moves its members together along their dominant joint direction v (first right singular vector of
+    theta[:, members], uncentred): theta_members ~= v * x. Returns (groups, loadings)."""
+    groups = [[int(j)] for j in (range(hw.shape[2]) if active is None else active)]
+
+    def loading(members):
+        if len(members) == 1:
+            return np.ones(1)
+        _, _, vt = np.linalg.svd(theta[:, members], full_matrices=False)
+        v = vt[0]
+        return -v if (theta[:, members] @ v).mean() < 0 else v
+
+    def columns():
+        cols = np.stack([np.einsum("nsj,j->ns", hw[:, :, g], loading(g)) for g in groups], axis=2)   # (n, S, G)
+        unit = cols / np.maximum(np.linalg.norm(cols, axis=1, keepdims=True), 1e-300)
+        cos = np.median(np.abs(np.einsum("nsa,nsb->nab", unit, unit)), axis=0)
+        np.fill_diagonal(cos, 0.0)
+        return cols, cos
+
+    while len(groups) > 1:                                          # 1. pairwise
+        _, cos = columns()
+        a, b = np.unravel_index(np.argmax(cos), cos.shape)
+        if cos[a, b] < merge_cos:
+            break
+        groups[a] = sorted(groups[a] + groups[b])
+        del groups[b]
+    while len(groups) > 1 and min_unique > 0:                       # 2. joint collinearity
+        cols, cos = columns()
+        uniq = np.median([unique_shares(c) for c in cols], axis=0)
+        g = int(np.argmin(uniq))
+        if uniq[g] >= min_unique:
+            break
+        partner = int(np.argmax(cos[g]))
+        a, b = min(g, partner), max(g, partner)
+        groups[a] = sorted(groups[a] + groups[b])
+        del groups[b]
+    return groups, [loading(g) for g in groups]
+
+
+class GasPathEKF:
+    """Extended Kalman filter on a reduced-order, dataset-calibrated gas-path observation model (pipeline.md 4-5).
+
+    Observation (per flight):  res = b(w) + B(w) x + v,  res = 14 relative sensor residuals vs the healthy baseline,
+    w = operating point [1, alt, Mach, TRA], b and B linear in w (re-linearised at every operating point; the model is
+    linear in x, so the EKF update is exact). State: random walk x_k = x_(k-1) + w_k, advanced once per FLIGHT.
+
+    Calibration (training engines only; T used offline as allowed by 4.7):
+      * b, B per candidate parameter: ridge regression of residuals on the 10 N-CMAPSS health parameters;
+      * R: robust variance of healthy-phase residuals (hs == 1) after removing b(w);
+      * states: observability analysis merges parameters whose sensor signatures are indistinguishable (merge_cos);
+      * Q: variance of cycle-to-cycle state changes, scaled by q_scale tuned on VALIDATION engines (one-step-ahead
+        predictive log-likelihood of the sensors - no labels); x0 / P0 from first flights.
+    Outputs per flight: state estimate + sigma, parameter estimates kf_<param> (= A x) + sigma, prior innovations,
+    per-sensor NIS and gating flags, joint NIS, and the smallest covariance eigenvalue (PSD check).
+    """
+
+    def __init__(self, sensors=XS_VARS, params=T_VARS, ridge: float = 1e-4, gate: float = 9.0, merge_cos: float = 0.95,
+                 merge_unique: float = 0.15, min_excitation: float = 1e-6):
+        self.sensors, self.params = list(sensors), list(params)
+        self.ridge, self.gate, self.merge_cos = ridge, gate, merge_cos
+        self.merge_unique, self.min_excitation = merge_unique, min_excitation
+        self.b = self.H = self.H_params = self.R = self.Q0 = self.x0 = self.P0 = self.A = None
+        self.offset, self.excluded = np.zeros(len(self.params)), []
+        self.groups, self.state_names, self.q_scale = None, None, 1.0
+        self.last_loglik = None
+
+    # -------------------------------------------------------------- calibration
+    @staticmethod
+    def _design(z, th):
+        return np.column_stack([z] + [th[:, [p]] * z for p in range(th.shape[1])])
+
+    def _whitened(self, z_rows):
+        sw = 1.0 / np.sqrt(self.R)
+        return np.stack([np.einsum("pks,k->sp", self.H_params, zr) * sw[:, None] for zr in z_rows])   # (n, S, P)
+
+    def fit(self, cyc: pd.DataFrame, cyc_val: pd.DataFrame | None = None, q_grid=(0.1, 0.3, 1.0, 3.0, 10.0),
+            n_points: int = 200, seed: int = 0) -> "GasPathEKF":
+        cyc = cyc.sort_values(["unit", "cycle"]).reset_index(drop=True)
+        y = cyc[[f"res_{s}" for s in self.sensors]].to_numpy(dtype=np.float64)
+        th = cyc[self.params].to_numpy(dtype=np.float64)
+        z = schedule(cyc)
+        x = self._design(z, th)
+        coef = np.linalg.solve(x.T @ x + self.ridge * np.eye(x.shape[1]), x.T @ y)     # (K + P*K, S)
+        k = z.shape[1]
+        self.b = coef[:k]                                                              # (K, S)
+        self.H_params = coef[k:].reshape(len(self.params), k, len(self.sensors))       # (P, K, S)
+        base = y - z @ self.b
+        healthy = cyc["hs"].to_numpy() == 1 if "hs" in cyc else np.zeros(len(cyc), dtype=bool)
+        r = robust_var(base[healthy]) if healthy.sum() >= 30 else np.var(y - x @ coef, axis=0)
+        self.R = np.maximum(np.nan_to_num(r, nan=0.0), 1e-12)
+        rng = np.random.default_rng(seed)
+        pts = rng.choice(len(z), size=min(n_points, len(z)), replace=False)
+        excited = th.std(axis=0) > self.min_excitation     # parameters that never move in training are not states
+        if not excited.any():
+            raise ValueError("no health parameter varies in the training engines - nothing for the EKF to estimate")
+        self.excluded = [t for t, e in zip(self.params, excited) if not e]
+        self.offset = np.where(excited, 0.0, th.mean(axis=0))   # held at their (constant) training value
+        self.groups, loads = merge_states(self._whitened(z[pts]), th, self.merge_cos, self.merge_unique,
+                                          active=np.flatnonzero(excited))
+        p, g = len(self.params), len(self.groups)
+        self.A = np.zeros((p, g))
+        for j, (members, v) in enumerate(zip(self.groups, loads)):
+            self.A[members, j] = v
+        self.state_names = ["+".join(self.params[m] for m in members) for members in self.groups]
+        self.H = np.einsum("pg,pks->gks", self.A, self.H_params)                        # (G, K, S)
+        states = th @ self.A                                                            # (n, G) training state values
+        units = cyc["unit"].to_numpy()
+        d = np.concatenate([np.diff(states[units == u], axis=0) for u in pd.unique(units)])
+        self.Q0 = np.var(d, axis=0) + np.mean(d, axis=0) ** 2 + 1e-12
+        first = np.stack([states[units == u][0] for u in pd.unique(units)])
+        self.x0, self.P0 = first.mean(axis=0), first.var(axis=0) + 1e-8
+        self.q_scale = 1.0
+        if cyc_val is not None and len(cyc_val):
+            ll = {}
+            for q in q_grid:
+                self.q_scale = float(q)
+                self._filter(cyc_val)
+                ll[q] = self.last_loglik
+            self.q_scale = float(max(ll, key=ll.get))
+            self.q_loglik = {str(k_): float(v) for k_, v in ll.items()}
         return self
 
-    def _names(self):
-        self.feature_names = []
-        for c in self.base_cols:
-            self.feature_names += [c, f"{c}__rel", f"{c}__rm", f"{c}__slope"]
-        self.feature_names += self.flight_cols
-        if self.use_cycle:
-            self.feature_names.append("cycle")
-        self.seq_names = self.base_cols + [f"{c}__rel" for c in self.base_cols] + self.flight_cols + \
-            (["cycle_scaled"] if self.use_cycle else [])
+    @property
+    def Q(self):
+        return self.q_scale * self.Q0
 
-    def transform(self, cyc: pd.DataFrame) -> pd.DataFrame:
-        cyc = cyc.sort_values(["unit", "cycle"]).reset_index(drop=True)
-        cols = self.base_cols + self.flight_cols
-        zall = (cyc[cols].to_numpy(dtype=np.float64) - self.mu) / self.sd
-        zall = np.nan_to_num(zall)
-        nb = len(self.base_cols)
-        z, zf = zall[:, :nb], zall[:, nb:]
-        units = cyc["unit"].to_numpy()
-        rel = np.empty_like(z)
-        b = self.baseline_cycles
+    # -------------------------------------------------------------- filtering
+    def h_at(self, z_row):
+        """Observation Jacobian B(w) (S, G) and bias b(w) (S,) at operating point z_row."""
+        return np.einsum("gks,k->sg", self.H, z_row), z_row @ self.b
+
+    def observe(self, z_row, x):
+        """Predicted residuals h(w, x) = b(w) + B(w) x."""
+        h, b = self.h_at(z_row)
+        return b + h @ x
+
+    def _filter(self, cyc: pd.DataFrame, res_override: np.ndarray | None = None) -> dict:
+        cyc = cyc.reset_index(drop=True)
+        res = cyc[[f"res_{s}" for s in self.sensors]].to_numpy(dtype=np.float64) if res_override is None \
+            else np.asarray(res_override, dtype=np.float64)
+        z = schedule(cyc)
+        n, s, g = len(cyc), len(self.sensors), len(self.state_names)
+        xs, sig, psig = np.zeros((n, g)), np.zeros((n, g)), np.zeros((n, len(self.params)))
+        innov, nis = np.full((n, s), np.nan), np.full((n, s), np.nan)
+        gated, nis_tot, min_eig = np.zeros((n, s), dtype=bool), np.full(n, np.nan), np.zeros(n)
+        q, eye = self.Q, np.eye(g)
+        ll, units = 0.0, cyc["unit"].to_numpy()
         for u in pd.unique(units):
             idx = np.flatnonzero(units == u)
-            g = z[idx]
-            base = np.empty_like(g)
-            for i in range(min(len(g), b)):
-                base[i] = np.median(g[: i + 1], axis=0)
-            if len(g) > b:
-                base[b:] = base[b - 1]
-            rel[idx] = g - base
-        reldf = pd.DataFrame(rel, columns=self.base_cols)
-        rm = reldf.groupby(units).transform(lambda s_: s_.rolling(self.roll, min_periods=1).mean())
-        slope = ((rm - rm.groupby(units).shift(self.roll)) / self.roll).fillna(0.0)
-        out = {"unit": units, "cycle_id": cyc["cycle"].to_numpy()}
-        for j, c in enumerate(self.base_cols):
-            out[c] = z[:, j]
-            out[f"{c}__rel"] = rel[:, j]
-            out[f"{c}__rm"] = rm[c].to_numpy()
-            out[f"{c}__slope"] = slope[c].to_numpy()
-        for j, c in enumerate(self.flight_cols):
-            out[c] = zf[:, j]
-        if self.use_cycle:
-            out["cycle"] = cyc["cycle"].to_numpy(dtype=np.float64)
-            out["cycle_scaled"] = out["cycle"] / 100.0
+            x, pm = self.x0.copy(), np.diag(self.P0)
+            consec = np.zeros(s, dtype=int)
+            for i in idx:
+                pm = pm + np.diag(q)
+                h, b = self.h_at(z[i])
+                ok = np.isfinite(res[i])
+                nu = res[i] - b - h @ x
+                innov[i, ok] = nu[ok]
+                if ok.any():
+                    sfull = h[ok] @ pm @ h[ok].T + np.diag(self.R[ok])
+                    try:
+                        nis_tot[i] = float(nu[ok] @ np.linalg.solve(sfull, nu[ok]))
+                    except np.linalg.LinAlgError:
+                        pass
+                for j in range(s):
+                    if not ok[j]:
+                        continue
+                    hj = h[j]
+                    v = res[i, j] - b[j] - hj @ x
+                    ph = pm @ hj
+                    sv = hj @ ph + self.R[j]
+                    nis[i, j] = v * v / sv
+                    if nis[i, j] > self.gate and consec[j] < 3:
+                        gated[i, j] = True
+                        consec[j] += 1
+                        continue
+                    consec[j] = 0
+                    ll += -0.5 * (np.log(2 * np.pi * sv) + v * v / sv)
+                    kg = ph / sv
+                    x = x + kg * v
+                    ikh = eye - np.outer(kg, hj)
+                    pm = ikh @ pm @ ikh.T + self.R[j] * np.outer(kg, kg)            # Joseph form
+                pm = 0.5 * (pm + pm.T)                                              # symmetrise
+                xs[i], sig[i] = x, np.sqrt(np.clip(np.diag(pm), 0, None))
+                psig[i] = np.sqrt(np.clip(np.einsum("pg,gh,ph->p", self.A, pm, self.A), 0, None))
+                min_eig[i] = float(np.linalg.eigvalsh(pm)[0])
+        self.last_loglik = ll / max(n, 1)
+        return {"xs": xs, "sig": sig, "psig": psig, "innov": innov, "nis": nis, "gated": gated, "nis_tot": nis_tot,
+                "min_eig": min_eig}
+
+    def run(self, cyc: pd.DataFrame, res_override: np.ndarray | None = None) -> pd.DataFrame:
+        """Filter every engine causally (rows sorted by unit, cycle)."""
+        r = self._filter(cyc, res_override)
+        theta = r["xs"] @ self.A.T + self.offset
+        out = {}
+        for j, name in enumerate(self.state_names):
+            out[f"ekf_{j}"] = r["xs"][:, j]
+            out[f"ekf_{j}_sigma"] = r["sig"][:, j]
+        for k_, t in enumerate(self.params):
+            out[f"kf_{t}"] = theta[:, k_]
+            out[f"kf_{t}_sigma"] = r["psig"][:, k_]
+        for j, sname in enumerate(self.sensors):
+            out[f"innov_{sname}"] = r["innov"][:, j]
+            out[f"nis_{sname}"] = r["nis"][:, j]
+            out[f"gated_{sname}"] = r["gated"][:, j]
+        out["nis_total"] = r["nis_tot"]
+        out["ekf_min_eig"] = r["min_eig"]
         return pd.DataFrame(out)
 
+    def diagnostics(self, cyc: pd.DataFrame, n_points: int = 200, seed: int = 0, weak: float | None = None) -> dict:
+        """Observability report (pipeline.md 5.4). Unique share = part of a whitened sensor signature NOT explained by
+        the other columns (1 = separable, ~0 = collinear), for the raw parameters and for the STATES actually estimated.
+        A component is identifiable if it was excited in training, none of its states is merged with another
+        component's parameters, and its state(s) are separable (share >= `weak`, default merge_unique). Merging a
+        component's own efficiency and flow into one state is the intended remedy and keeps it identifiable."""
+        weak = self.merge_unique if weak is None else weak
+        z = schedule(cyc)
+        rng = np.random.default_rng(seed)
+        pts = z[rng.choice(len(z), size=min(n_points, len(z)), replace=False)]
+        hw = self._whitened(pts)                                                      # (n, S, P)
+        active = [k for k, t in enumerate(self.params) if t not in self.excluded]
+        uniq_param = np.full(len(self.params), np.nan)
+        uniq_param[active] = np.median([unique_shares(h[:, active]) for h in hw], axis=0)
+        hs_ = np.einsum("nsp,pg->nsg", hw, self.A)                                    # whitened STATE Jacobians
+        uniq_state = np.median([unique_shares(h) for h in hs_], axis=0)
+        sv = np.median([np.linalg.svd(h, compute_uv=False) for h in hs_], axis=0)
+        comp = {}
+        for c, (e, f) in COMP_THETA.items():
+            ie, if_ = self.params.index(e), self.params.index(f)
+            states = [g for g, grp in enumerate(self.groups) if ie in grp or if_ in grp]
+            if not states:
+                comp[c] = {"merged_with": [], "states": [], "excited": False, "own_parameters_merged": False,
+                           "min_unique_share": None, "identifiable": False,
+                           "reason": "no degradation of this component in the training engines"}
+                continue
+            members = {m for g in states for m in self.groups[g]}
+            others = sorted({cc for cc, (e2, f2) in COMP_THETA.items() if cc != c and
+                             (self.params.index(e2) in members or self.params.index(f2) in members)})
+            m = float(min(uniq_state[g] for g in states))
+            ident = bool(not others and m >= weak)
+            reason = "ok" if ident else (f"indistinguishable from {', '.join(others)}" if others
+                                         else "sensor signature too close to other states")
+            comp[c] = {"merged_with": others, "states": [self.state_names[g] for g in states], "excited": True,
+                       "own_parameters_merged": len(states) == 1 and len(members & {ie, if_}) == 2,
+                       "min_unique_share": m, "identifiable": ident, "reason": reason}
+        return {"unique_share_per_parameter": {t: (None if np.isnan(v) else float(v)) for t, v in zip(self.params, uniq_param)},
+                "unique_share_per_state": {n: float(v) for n, v in zip(self.state_names, uniq_state)},
+                "excluded_not_excited": list(self.excluded), "states": self.state_names,
+                "state_singular_values_median": [float(v) for v in sv],
+                "state_condition_number_median": float(sv[0] / max(sv[-1], 1e-300)),
+                "components": comp, "merge_cos": self.merge_cos, "merge_unique": self.merge_unique,
+                "q_scale": self.q_scale}
+
     def to_dict(self):
-        return {"base_cols": self.base_cols, "flight_cols": self.flight_cols, "baseline_cycles": self.baseline_cycles,
-                "roll": self.roll, "use_cycle": self.use_cycle, "mu": self.mu.tolist(), "sd": self.sd.tolist(),
-                "feature_names": self.feature_names, "seq_names": self.seq_names}
+        return {"sensors": self.sensors, "params": self.params, "ridge": self.ridge, "gate": self.gate,
+                "merge_cos": self.merge_cos, "merge_unique": self.merge_unique, "min_excitation": self.min_excitation,
+                "offset": np.asarray(self.offset).tolist(), "excluded": list(self.excluded), "sched": SCHED_VARS, "groups": self.groups, "state_names": self.state_names,
+                "A": self.A.tolist(), "b": self.b.tolist(), "H": self.H.tolist(), "H_params": self.H_params.tolist(),
+                "R": self.R.tolist(), "Q0": self.Q0.tolist(), "q_scale": self.q_scale, "x0": self.x0.tolist(),
+                "P0": self.P0.tolist()}
 
     @classmethod
     def from_dict(cls, d):
-        f = cls(d["base_cols"], d["baseline_cycles"], d["roll"], d["use_cycle"])
-        f.flight_cols = d["flight_cols"]
-        f.mu, f.sd = np.asarray(d["mu"]), np.asarray(d["sd"])
-        f._names()
-        return f
+        k = cls(d["sensors"], d["params"], d["ridge"], d["gate"], d["merge_cos"], d.get("merge_unique", 0.15),
+                d.get("min_excitation", 1e-6))
+        k.offset = np.asarray(d.get("offset", np.zeros(len(d["params"]))), dtype=np.float64)
+        k.excluded = list(d.get("excluded", []))
+        for a in ("A", "b", "H", "H_params", "R", "Q0", "x0", "P0"):
+            setattr(k, a, np.asarray(d[a], dtype=np.float64))
+        k.groups, k.state_names, k.q_scale = d["groups"], d["state_names"], float(d["q_scale"])
+        return k
 
 
-def build_windows(frame: pd.DataFrame, cols: list[str], window: int):
-    """Causal windows over cycles: window i = the `window` cycles ending at row i of the same engine (start of
-    life padded by repeating the first cycle). Returns (big, starts); window i = big[starts[i]:starts[i]+window]."""
-    return build_windows_array(frame[cols].to_numpy(np.float32), frame["unit"].to_numpy(), window)
-
-
-def build_windows_array(seq: np.ndarray, units: np.ndarray, window: int):
-    """build_windows on an array whose rows are grouped by engine and in time order within each engine."""
-    starts = np.empty(len(seq), dtype=np.int64)
-    chunks, offset = [], 0
-    for u in pd.unique(units):
-        idx = np.flatnonzero(units == u)
-        g = seq[idx]
-        padded = np.concatenate([np.repeat(g[:1], window - 1, axis=0), g], axis=0)
-        starts[idx] = offset + np.arange(len(g))
-        chunks.append(padded)
-        offset += len(padded)
-    return np.concatenate(chunks, axis=0), starts
-
-
-def gather_windows(big: np.ndarray, starts: np.ndarray, window: int, rows) -> np.ndarray:
-    rows = np.asarray(rows)
-    return big[starts[rows][:, None] + np.arange(window)[None, :]]
-
-
-def run_layers_1_to_3(cyc: pd.DataFrame, ref: HealthyReference, kf: GasPathKF, d_ref) -> pd.DataFrame:
-    """Per-cycle table -> residuals (Layer 2) -> Kalman filter states and component HI (Layer 3)."""
+def run_layers(cyc: pd.DataFrame, ref: HealthyReference, ekf: GasPathEKF, d_ref) -> pd.DataFrame:
+    """Per-flight table -> residuals (Layer 2) -> EKF states, innovations and health mapping (Layer 3)."""
     cyc = add_residuals(cyc.sort_values(["unit", "cycle"]).reset_index(drop=True), ref)
-    k = kf.run(cyc)
+    k = ekf.run(cyc)
     return pd.concat([cyc, k, kf_component_health(k, d_ref)], axis=1)
 
 
-# ----------------------------------------------------------------------------------------------- post-processing
-def clip_target(tgt: str, v) -> np.ndarray:
-    return np.clip(v, 0, None) if tgt == "rul" else np.clip(v, 0, 1)
+# ----------------------------------------------------------------------------------------------- Layer 4: features
+FLIGHT_COLS = ["alt_mean", "Mach_mean", "TRA_mean", "T2_mean", "alt_max", "Mach_max", "duration_s", "fc"]
+EXPOSURE_COLS = ["cycle", "exposure_h", "hist_len"]
+WINDOW_STATS = ("rm", "rs", "rmin", "rmax", "slope")      # trailing-window mean, std, min, max, slope (6.2)
+FORBIDDEN_FEATURES = {"rul", "unit", "unit_local", "hs", "dataset", "split", "cycle_id"}
 
 
-def causal_smooth(units, cycles, values, alpha: float, kind: str = "hi") -> np.ndarray:
-    """Per-engine causal exponential smoothing of per-cycle predictions (rows sorted by unit, cycle; alpha=1: off).
-    For RUL the previous estimate is first propagated by the known dynamics: RUL drops by 1 per flight cycle."""
-    v = np.asarray(values, dtype=np.float64).copy()
-    if alpha >= 1.0 or len(v) == 0:
-        return v
-    units, cycles = np.asarray(units), np.asarray(cycles, dtype=np.float64)
-    for u in pd.unique(units):
-        idx = np.flatnonzero(units == u)
-        est = v[idx[0]]
-        for k in range(1, len(idx)):
-            prior = est - (cycles[idx[k]] - cycles[idx[k - 1]]) if kind == "rul" else est
-            est = alpha * v[idx[k]] + (1.0 - alpha) * prior
-            v[idx[k]] = est
-    return v
+def sensor_summary_cols() -> list[str]:
+    return [f"{p}{s}" for p in SUMMARY_PREFIXES for s in XS_VARS]
 
 
-def smooth_target(tgt: str, units, cycles, values, alpha: float) -> np.ndarray:
-    return clip_target(tgt, causal_smooth(units, cycles, clip_target(tgt, values), alpha,
-                                          "rul" if tgt == "rul" else "hi"))
+def default_feature_columns(n_states: int):
+    """Feature blocks of pipeline.md 6.1: (temporal bases, static columns)."""
+    temporal = [f"res_{s}" for s in XS_VARS] + [f"p_{p}" for p in PROXIES] + [f"ekf_{j}" for j in range(n_states)]
+    static = sensor_summary_cols() + [f"ekf_{j}_sigma" for j in range(n_states)] + [f"innov_{s}" for s in XS_VARS]
+    return temporal, static
 
 
-# ----------------------------------------------------------------------------------------------- 0.1 Hz CNN inputs
-SEQ_EVERY = 10          # keep every 10th 1 Hz row -> 0.1 Hz, as in Arias Chao et al. (hybrid physics + CNN)
+def feature_group(name: str) -> str:
+    """Block of a feature: raw | res | phys | ekf | innov | cond (flight condition / exposure)."""
+    base = name.split("__")[0]
+    if base in FLIGHT_COLS or base in EXPOSURE_COLS:
+        return "cond"
+    for pre, grp in (("res_", "res"), ("p_", "phys"), ("ekf_", "ekf"), ("innov_", "innov")):
+        if base.startswith(pre):
+            return grp
+    if base.startswith(SUMMARY_PREFIXES):
+        return "raw"
+    return "other"
 
 
-def downsample_1hz(df: pd.DataFrame, every: int = SEQ_EVERY) -> pd.DataFrame:
-    """Every `every`-th row of each (unit, cycle), keeping time order: unit, cycle, W, X_s (float32)."""
-    pos = df.groupby(["unit", "cycle"], sort=False).cumcount().to_numpy()
-    out = df.loc[pos % every == 0, ["unit", "cycle"] + W_VARS + XS_VARS].reset_index(drop=True)
-    out[W_VARS + XS_VARS] = out[W_VARS + XS_VARS].astype(np.float32)
-    out["unit"], out["cycle"] = out["unit"].astype(np.int64), out["cycle"].astype(np.int64)
-    return out
+def is_window_feature(name: str) -> bool:
+    return "__" in name
 
 
-def cycle_rows(samples: pd.DataFrame, cyc: pd.DataFrame) -> np.ndarray:
-    """Row of `cyc` holding each sample's (unit, cycle), -1 if absent."""
-    key = lambda d: d["unit"].to_numpy(np.int64) * 1_000_000 + d["cycle"].to_numpy(np.int64)   # noqa: E731
-    return pd.Index(key(cyc)).get_indexer(key(samples))
+def source_of(feature: str) -> str:
+    """Physical source of a model feature (for grouping SHAP values)."""
+    return feature.split("__")[0]
 
 
-class SampleEncoder:
-    """CNN input channels for each 0.1 Hz sample: scaled flight condition, raw sensors, residual vs the healthy-engine
-    map (Layer 2) and the engine's Kalman-filter health parameters for that cycle (Layer 3), z-scored on training
-    samples. `occlude` replaces one sensor by its healthy-engine value (residual 0) for the occlusion explainer."""
+def audit_features(names) -> list[str]:
+    """Leakage audit (6.3): no target, hidden parameters, identifiers or health flags among the model inputs."""
+    bad = [n for n in names if n.split("__")[0] in FORBIDDEN_FEATURES or n.split("__")[0] in T_VARS
+           or n.startswith(("hi_", "truth_", "kf_hi_", "rul"))]
+    if bad:
+        raise ValueError(f"leaking features: {bad}")
+    return list(names)
 
-    def __init__(self, sensors=XS_VARS, theta=T_VARS):
-        self.sensors, self.theta = list(sensors), list(theta)
-        self.mu = self.sd = None
 
-    @property
-    def channels(self) -> list[str]:
-        return [f"w_{v}" for v in W_VARS] + [f"x_{s}" for s in self.sensors] + [f"res_{s}" for s in self.sensors] + \
-            [f"kf_{t}" for t in self.theta]
+class CausalFeaturizer:
+    """Causal per-engine features (pipeline.md 6): current values of all blocks, trailing-window mean / std / min / max
+    / slope of the temporal bases over `roll` flights, flight condition and operating exposure (cycle count, cumulative
+    flight hours). Minimum-history rule: windows use the flights available so far (std = 0 and slope = 0 with fewer
+    than 2 flights; `hist_len` tells the model how many). Missing values are filled with training medians."""
 
-    def raw(self, samples: pd.DataFrame, cyc: pd.DataFrame, ref: HealthyReference, occlude: str | None = None,
-            chunk: int = 500_000):
-        """-> (channels float32 (n, C), units (n,), cyc rows (n,)) for the samples whose cycle is in `cyc`."""
-        rows = cycle_rows(samples, cyc)
-        keep = np.flatnonzero(rows >= 0)
-        rows = rows[keep]
-        w_all = samples[W_VARS].to_numpy(np.float32)
-        x_all = samples[self.sensors].to_numpy(np.float32)
-        kf = cyc[[f"kf_{t}" for t in self.theta]].to_numpy(np.float64)
-        n_w, n_s = len(W_VARS), len(self.sensors)
-        out = np.empty((len(keep), len(self.channels)), dtype=np.float32)
-        for i in range(0, len(keep), chunk):
-            sel = keep[i:i + chunk]
-            w, x = w_all[sel].astype(np.float64), x_all[sel].astype(np.float64)
-            ideal = ref.predict(w)
-            res = x / np.where(np.abs(ideal) < 1e-9, np.nan, ideal) - 1.0
-            if occlude is not None:
-                j = self.sensors.index(occlude)
-                x[:, j], res[:, j] = ideal[:, j], 0.0
-            out[i:i + chunk] = np.column_stack([scaled_w(w), x, np.nan_to_num(res), kf[rows[i:i + chunk]]])
-        return out, samples["unit"].to_numpy()[keep], rows
+    def __init__(self, temporal_cols, static_cols, roll: int = 5):
+        self.temporal_cols, self.static_cols, self.roll = list(temporal_cols), list(static_cols), int(roll)
+        self.fill: dict = {}
+        self.feature_names = [c for b in self.temporal_cols for c in [b] + [f"{b}__{st}" for st in WINDOW_STATS]] + \
+            self.static_cols + FLIGHT_COLS + EXPOSURE_COLS
+        audit_features(self.feature_names)
 
-    def fit(self, raw: np.ndarray, mask: np.ndarray, chunk: int = 500_000) -> "SampleEncoder":
-        s = np.zeros(raw.shape[1])
-        s2 = np.zeros(raw.shape[1])
-        n = 0
-        for i in range(0, len(raw), chunk):
-            r = raw[i:i + chunk][mask[i:i + chunk]].astype(np.float64)
-            s, s2, n = s + r.sum(0), s2 + (r ** 2).sum(0), n + len(r)
-        self.mu = s / n
-        sd = np.sqrt(np.clip(s2 / n - self.mu ** 2, 0, None))
-        self.sd = np.where(sd < 1e-12, 1.0, sd)
+    def _build(self, cyc: pd.DataFrame) -> pd.DataFrame:
+        cyc = cyc.sort_values(["unit", "cycle"]).reset_index(drop=True)
+        units = cyc["unit"].to_numpy()
+        a = cyc[self.temporal_cols].to_numpy(dtype=np.float64)
+        w = self.roll
+        stats = {st: np.zeros_like(a) for st in WINDOW_STATS}
+        hist = np.zeros(len(cyc))
+        expo = np.zeros(len(cyc))
+        for u in pd.unique(units):
+            idx = np.flatnonzero(units == u)
+            g = pd.DataFrame(a[idx])
+            roll = g.rolling(w, min_periods=1)
+            stats["rm"][idx] = roll.mean().to_numpy()
+            stats["rs"][idx] = roll.std(ddof=0).to_numpy()
+            stats["rmin"][idx] = roll.min().to_numpy()
+            stats["rmax"][idx] = roll.max().to_numpy()
+            x = a[idx]
+            sl = np.zeros_like(x)
+            for i in range(len(idx)):
+                win = x[max(0, i - w + 1): i + 1]
+                if len(win) >= 2:
+                    t = np.arange(len(win)) - (len(win) - 1) / 2.0
+                    sl[i] = (t[:, None] * (win - np.nanmean(win, axis=0))).sum(axis=0) / (t ** 2).sum()
+            stats["slope"][idx] = sl
+            hist[idx] = np.minimum(np.arange(1, len(idx) + 1), w)
+            expo[idx] = np.cumsum(cyc["duration_s"].to_numpy(dtype=np.float64)[idx]) / 3600.0
+        out = {"unit": units, "cycle_id": cyc["cycle"].to_numpy()}
+        for j, b in enumerate(self.temporal_cols):
+            out[b] = a[:, j]
+            for st in WINDOW_STATS:
+                out[f"{b}__{st}"] = stats[st][:, j]
+        for c in self.static_cols + FLIGHT_COLS:
+            out[c] = cyc[c].to_numpy(dtype=np.float64) if c in cyc else np.full(len(cyc), np.nan)
+        out["cycle"] = cyc["cycle"].to_numpy(dtype=np.float64)
+        out["exposure_h"], out["hist_len"] = expo, hist
+        return pd.DataFrame(out)
+
+    def fit(self, cyc_train: pd.DataFrame) -> "CausalFeaturizer":
+        f = self._build(cyc_train)[self.feature_names]
+        self.fill = {c: float(v) if np.isfinite(v) else 0.0 for c, v in f.median().items()}
         return self
 
-    def normalize(self, raw: np.ndarray) -> np.ndarray:
-        raw -= self.mu.astype(np.float32)
-        raw /= self.sd.astype(np.float32)
-        return raw
-
-    def transform(self, samples, cyc, ref, occlude=None):
-        raw, units, rows = self.raw(samples, cyc, ref, occlude)
-        return self.normalize(raw), units, rows
+    def transform(self, cyc: pd.DataFrame) -> pd.DataFrame:
+        out = self._build(cyc)
+        if self.fill:
+            out[self.feature_names] = out[self.feature_names].fillna(self.fill)
+        return out
 
     def to_dict(self):
-        return {"sensors": self.sensors, "theta": self.theta, "channels": self.channels,
-                "mu": self.mu.tolist(), "sd": self.sd.tolist()}
+        return {"temporal_cols": self.temporal_cols, "static_cols": self.static_cols, "roll": self.roll,
+                "fill": self.fill, "feature_names": self.feature_names}
 
     @classmethod
     def from_dict(cls, d):
-        e = cls(d["sensors"], d["theta"])
-        e.mu, e.sd = np.asarray(d["mu"], dtype=np.float64), np.asarray(d["sd"], dtype=np.float64)
-        return e
+        f = cls(d["temporal_cols"], d["static_cols"], d["roll"])
+        f.fill = d.get("fill", {})
+        return f
 
 
-def cycle_mean(rows: np.ndarray, values: np.ndarray, n_rows: int) -> np.ndarray:
-    """Average per-sample predictions (n, k) into per-cycle rows (n_rows, k); NaN for cycles without samples."""
-    values = np.asarray(values, dtype=np.float64).reshape(len(rows), -1)
-    cnt = np.bincount(rows, minlength=n_rows).astype(np.float64)
-    sums = np.column_stack([np.bincount(rows, weights=values[:, j], minlength=n_rows) for j in range(values.shape[1])])
-    return sums / np.where(cnt == 0, np.nan, cnt)[:, None]
-
-
-def cnn_cycle_predictions(predict_windows, enc: SampleEncoder, samples: pd.DataFrame, cyc: pd.DataFrame,
-                          ref: HealthyReference, window: int, occlude: str | None = None, batch: int = 8192):
-    """Per-cycle CNN outputs (len(cyc), k): mean over the 0.1 Hz windows ending inside each flight cycle.
-    `predict_windows` maps float32 (b, window, C) -> (b, k) in target units."""
-    ch, units, rows = enc.transform(samples, cyc, ref, occlude)
-    if len(ch) == 0:
-        return None
-    big, starts = build_windows_array(ch, units, window)
-    del ch
-    out = [predict_windows(gather_windows(big, starts, window, np.arange(i, min(i + batch, len(rows)))))
-           for i in range(0, len(rows), batch)]
-    return cycle_mean(rows, np.concatenate(out), len(cyc))
+# ----------------------------------------------------------------------------------------------- robustness test helper
+def inject_sensor_fault(cyc: pd.DataFrame, ref: HealthyReference, sensor: str, rel_bias: float,
+                        start_frac: float = 0.5, every: int | None = None) -> pd.DataFrame:
+    """Copy of a per-flight table with a fault in sensor `sensor`: from `start_frac` of each engine's life its flight
+    mean (and min/max/last) is scaled by (1 + rel_bias) - every flight (persistent bias) or every `every`-th flight
+    (spikes). Residuals are recomputed; physics proxies are left untouched (a conservative test). Adds `faulted`.
+    Used on REAL test engines only to test robustness - nothing is fitted on it."""
+    out = cyc.sort_values(["unit", "cycle"]).reset_index(drop=True)
+    pos = out.groupby("unit").cumcount().to_numpy()
+    size = out.groupby("unit")["cycle"].transform("size").to_numpy()
+    faulted = pos >= start_frac * size
+    if every:
+        faulted &= (pos % every == 0)
+    for pre in ("m_", "mn_", "mx_", "ls_"):
+        col = f"{pre}{sensor}"
+        if col in out:
+            out.loc[faulted, col] = out.loc[faulted, col] * (1.0 + rel_bias)
+    out = add_residuals(out, ref)
+    out["faulted"] = faulted
+    return out

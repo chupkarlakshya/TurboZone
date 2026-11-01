@@ -1,257 +1,334 @@
 # Training guide (ML team)
 
-This folder trains every model behind the GENZONE turbofan digital twin, from the raw NASA N-CMAPSS files to a
-**model bundle** (one zip) that the backend and dashboard load. This page covers what you need to retrain, change, or
-evaluate the models.
+This folder trains the GENZONE turbofan digital twin **exactly as specified in [`pipeline.md`](../pipeline.md)**:
+a physics-informed Extended Kalman Filter plus a stacking ensemble of four tree models, trained on NASA N-CMAPSS. The
+output is one versioned **model bundle** (a zip) that the backend and dashboard load.
 
-**TL;DR**
-1. Open [`ncmapss_colab_training.ipynb`](ncmapss_colab_training.ipynb) in Google Colab and pick a **T4 GPU** runtime.
-2. In the configuration cell, set `RUN = "quick"` (1 file, pipeline check) or `RUN = "full"` (all 10 files, final model).
-3. Run all cells. The last cell downloads `genzone_ncmapss_<RUN>_bundle.zip`.
-4. Unzip it into `backend/models/`, then run `python -m backend.check_parity`. It must print `PARITY OK`.
+```text
+N-CMAPSS HDF5 -> schema inspection + validation -> flight-end aggregation -> engine split (train / validation / test)
+  -> healthy-condition baseline g(W), cross-fitted residuals -> reduced-order gas-path model + EKF
+  -> causal features -> Random Forest, XGBoost, LightGBM, CatBoost -> out-of-fold predictions -> scaler + Ridge
+  -> RUL + empirical interval -> evaluation, ablation E0-E7, SHAP + Ridge contributions -> bundle
+```
 
----
+> **Extensions.** On top of the spec, the notebook adds two optional sections: **component-health forecasts** (section 14;
+> health 10, 25 and 50 flights ahead, `RUN_FORECAST`) and **component RUL** (section 14b; flights until a component
+> reaches its failure level, `RUN_COMPONENT_RUL`). See section 6.
+
+> **Status.** The first `RUN = "quick"` (DS02) ran end to end on Colab (45 min) and its bundle passes `check_parity`.
+> Results are summarised in section 10. Three fixes were made afterwards and have **not been run on Colab yet**: early
+> stopping for LightGBM/CatBoost (speed), EKF state selection (never-moving parameters dropped, jointly collinear states
+> merged) and an interval per predicted-RUL range. Re-run `quick` once before the long `full` run.
+
+## Quick start
+
+1. Open [`ncmapss_colab_training.ipynb`](ncmapss_colab_training.ipynb) in Google Colab (a **CPU** runtime is enough).
+2. Configuration cell: `RUN = "quick"` for the first run (DS02 only), later `RUN = "full"` (9 files; DS08d excluded).
+3. **Run all** and accept the Google Drive prompt (the aggregate cache lives in `MyDrive/genzone/`).
+4. When it finishes, `genzone_ncmapss_<RUN>_bundle.zip` downloads (a copy is saved in `MyDrive/genzone/`).
+5. Unzip it into `backend/models/`, then:
+   ```bash
+   python -m backend.check_parity      # must print PARITY OK
+   python -m backend                   # dashboard at http://localhost:8000
+   ```
+   `backend/models/` currently holds the first quick-run bundle (DS02 test engines 1011, 1014, 1015); the old pipeline's
+   bundle is kept only in `docs/genzone_ncmapss_full_bundle/` for reference.
 
 ## 1. Dataset: NASA N-CMAPSS
 
-**What it is:** NASA's *New Commercial Modular Aero-Propulsion System Simulation* dataset (C-MAPSS 2): run-to-failure
-simulations of a two-spool turbofan flown on **real recorded flight profiles**, sampled at **1 Hz**. Each engine
-starts healthy and degrades until failure. Degradation is set through 10 component health parameters
-(efficiency/flow modifiers of fan, LPC, HPC, HPT, LPT).
+Run-to-failure simulations of a two-spool turbofan flown on **real recorded flight profiles**, sampled at **1 Hz**
+(C-MAPSS 2). Each engine starts healthy and degrades until failure; degradation is imposed through 10 hidden health
+parameters (efficiency and flow modifiers of fan, LPC, HPC, HPT, LPT).
 
-- **Source we download from:** Kaggle mirror [`bishals098/nasa-cmapss-2-engine-degradation`](https://www.kaggle.com/datasets/bishals098/nasa-cmapss-2-engine-degradation).
-  It's public, and kagglehub usually downloads it without credentials.
-- **Original source:** NASA Prognostics Center of Excellence data repository ("Turbofan Engine Degradation Simulation-2").
-- **Reference paper:** M. Arias Chao, C. Kulkarni, K. Goebel, O. Fink, *"Aircraft Engine Run-to-Failure Dataset under
-  Real Flight Conditions for Prognostics and Diagnostics"*, Data 6(1):5, 2021. The PDF
-  `Run_to_Failure_Simulation_Under_Real_Flight_Conditions_Dataset.pdf` ships with the Kaggle dataset.
-- Check the Kaggle page for licence and citation terms before publishing results.
-
-### Files (10 subsets, ~29 GB total)
+- **Downloaded from:** Kaggle mirror [`bishals098/nasa-cmapss-2-engine-degradation`](https://www.kaggle.com/datasets/bishals098/nasa-cmapss-2-engine-degradation) (public).
+- **Original:** NASA Prognostics Center of Excellence data repository.
+- **Cite:** M. Arias Chao, C. Kulkarni, K. Goebel, O. Fink, *Aircraft Engine Run-to-Failure Dataset under Real Flight
+  Conditions for Prognostics and Diagnostics*, Data 6(1):5, 2021, https://doi.org/10.3390/data6010005. Check the Kaggle
+  page for licence terms.
 
 | File | Size | Notes |
 |---|---|---|
 | `N-CMAPSS_DS01-005.h5` | 2.87 GB | |
-| `N-CMAPSS_DS02-006.h5` | 2.45 GB | used by `RUN="quick"`; PHM 2021 challenge subset; only HPT/LPT degrade abnormally |
+| `N-CMAPSS_DS02-006.h5` | 2.45 GB | `RUN="quick"`; PHM 2021 challenge subset; only HPT/LPT degrade abnormally |
 | `N-CMAPSS_DS03-012.h5` | 3.69 GB | |
 | `N-CMAPSS_DS04.h5` | 3.75 GB | largest file (sets peak RAM) |
-| `N-CMAPSS_DS05.h5` | 2.60 GB | |
-| `N-CMAPSS_DS06.h5` | 2.55 GB | |
-| `N-CMAPSS_DS07.h5` | 2.71 GB | |
+| `N-CMAPSS_DS05.h5` … `DS07.h5` | 2.55–2.71 GB | |
 | `N-CMAPSS_DS08a-009.h5` | 3.24 GB | |
 | `N-CMAPSS_DS08c-008.h5` | 2.41 GB | |
-| `N-CMAPSS_DS08d-010.h5` | 2.89 GB | **the Kaggle copy is truncated by 32 bytes**; repaired automatically (see Troubleshooting) |
+| `N-CMAPSS_DS08d-010.h5` | 2.89 GB | **not used**: Kaggle's copy is truncated inside HDF5's internal index and cannot be read (zero-padding lets it open, then reading fails with "free block size is zero?") |
 
-Different subsets have different failure modes, so **only the full run has abnormal degradation for every
-component**. With DS02 alone, fan, LPC and HPC health stay constant at 1.0.
+There is no `DS08b`. Inside each file (`dev` = development engines, `test` = NASA's held-out engines):
 
-### Inside each `.h5`
-
-Each file has a `dev` (training) and a `test` split with **different engines**. We keep NASA's split:
-`dev` engines are used for training and cross-validation, and `test` engines only for the final evaluation.
-
-| Key | Content | Columns (`*_var` holds the names) |
+| Key | Content | Use in this pipeline |
 |---|---|---|
-| `W_dev/test` | flight condition | `alt` (ft), `Mach`, `TRA` (throttle, %), `T2` (fan inlet temperature, °R) |
-| `X_s_dev/test` | 14 measured sensors | `T24 T30 T48 T50` (°R), `P15 P2 P21 P24 Ps30 P40 P50` (psia), `Nf Nc` (rpm), `Wf` (lbm/s) |
-| `X_v_dev/test` | virtual (unmeasured) sensors | we only read `T40 P30 P45`, for **display only**; they are never model inputs |
-| `T_dev/test` | true health parameters (labels) | `fan/LPC/HPC/HPT/LPT` × `eff_mod / flow_mod` (10 columns) |
-| `A_dev/test` | auxiliary | `unit` (engine id), `cycle` (flight number), `Fc` (flight class), `hs` (1 = healthy phase) |
-| `Y_dev/test` | label | RUL in flight cycles |
+| `W_*` | `alt` (ft), `Mach`, `TRA` (%), `T2` (°R) | flight condition: baseline, EKF scheduling, features |
+| `X_s_*` | `T24 T30 T48 T50` (°R), `P15 P2 P21 P24 Ps30 P40 P50` (psia), `Nf Nc` (rpm), `Wf` (lbm/s) | measured sensors |
+| `X_v_*` | virtual sensors (`T40 P30 P45` read) | **display only**, never model inputs |
+| `T_*` | 10 hidden health parameters | **offline only**: EKF calibration and validating the health mapping |
+| `A_*` | `unit`, `cycle` (flight), `Fc` (flight class), `hs` (1 = healthy phase) | grouping, ordering, healthy-row selection |
+| `Y_*` | RUL in flight cycles | **target only** |
 
-The loader (`load_h5`) maps columns **by name**, not by position. It also drops physically impossible rows
-(sensor ≤ 0, unit or cycle < 1).
-
----
-
-## 2. The training script
+## 2. Files
 
 | File | Role |
 |---|---|
-| [`ncmapss_colab_training.py`](ncmapss_colab_training.py) | **The source of truth.** All training code, as `# %%` cells. Edit this file. |
-| [`ncmapss_colab_training.ipynb`](ncmapss_colab_training.ipynb) | Generated notebook for Colab. **Don't edit it by hand**; regenerate it. |
-| [`build_notebook.py`](build_notebook.py) | Builds the notebook: `python training/build_notebook.py`. It replaces the `# %% [pipeline]` cell with the full source of `backend/pipeline/ncmapss.py`. |
-| [`../backend/pipeline/ncmapss.py`](../backend/pipeline/ncmapss.py) | **Shared pipeline code** (Layers 1–3, feature engineering, CNN inputs, smoothing). The same file runs in Colab and in the backend, so training and serving compute features identically. |
+| [`ncmapss_colab_training.py`](ncmapss_colab_training.py) | **Source of truth**: the training code as `# %%` cells. Edit this. |
+| [`ncmapss_colab_training.ipynb`](ncmapss_colab_training.ipynb) | Generated notebook for Colab. Never edit by hand. |
+| [`build_notebook.py`](build_notebook.py) | `python training/build_notebook.py`: inlines the shared modules into the `[pipeline:…]` cells and stamps the build (git commit + code hash). |
+| [`../backend/pipeline/ncmapss.py`](../backend/pipeline/ncmapss.py) | Shared: ingestion, schema validation, aggregation, healthy baseline, EKF, features, leakage audit. |
+| [`../backend/pipeline/stacking.py`](../backend/pipeline/stacking.py) | Shared: four base models, tuning, engine splits/folds, OOF stacking, Ridge, metrics, interval. |
 
-So: change `ncmapss.py` or `ncmapss_colab_training.py`, run `python training/build_notebook.py`, run
-`python -m pytest backend/tests`, then commit the `.py` and `.ipynb` files together.
+**Changing the code:** edit the `.py` file(s) → `python -m pytest backend/tests` → `python training/build_notebook.py` →
+commit the `.py` and the `.ipynb` together. If you change `load_h5` / `aggregate_cycles`, bump `AGG_VERSION` in
+`ncmapss.py` (this invalidates the Drive cache).
 
-### Running it
+## 3. Running on Colab
 
-**Google Colab (recommended)**
-1. Runtime → Change runtime type → **T4 GPU**. High-RAM is optional.
-2. Upload or open the notebook and edit the configuration cell (`RUN = "full"` for the final model).
-3. Run all. Each `.h5` is downloaded (kagglehub), aggregated, then deleted before the next one, so disk use stays at
-   about one file.
-4. Kaggle credentials are only needed if the anonymous download fails. In that case add Colab secrets
-   `KAGGLE_USERNAME` / `KAGGLE_KEY` (kaggle.com → Settings → API → Create New Token).
-5. **Without Kaggle:** put the `.h5` files in Google Drive, mount it, and either leave them under
-   `/content/drive/MyDrive` (searched automatically) or set the environment variable `NCMAPSS_DIR` to the folder.
+| Step | What happens |
+|---|---|
+| Setup | installs xgboost, lightgbm, catboost, shap, h5py, kagglehub, pyarrow; reads Kaggle secrets if present |
+| Configuration | **edit `RUN`**; other settings in section 4 |
+| Drive | mounts Drive for the cache; no Drive → set `USE_DRIVE = False` (works, nothing is reused) |
+| Pre-flight | lists the files on Kaggle with sizes and checks free disk |
+| Layer 1 | per file: cache hit → seconds; else download (kagglehub), inspect, validate, aggregate, cache, delete the `.h5` |
+| Engine split | train / validation / test engines fixed **before anything is fitted** |
+| Layers 2–3 | healthy baseline, cross-fitted residuals, EKF calibration, process-noise tuning, diagnostics, health-mapping validation |
+| Features → models → stack | causal features, tuning on validation, out-of-fold predictions, Ridge |
+| Evaluation, ablation | test engines (once), E0–E7 |
+| Forecasting (extension) | health forecasts, baselines, intervals |
+| SHAP | explanations |
+| Export | bundle zip, copy to Drive, download |
 
-**Kaggle notebooks:** these work too. Attach the dataset; the script finds files under `/kaggle/input` and installs
-`onnx`/`onnxruntime` itself (turn Internet on in the notebook settings). Don't pick a **P100** GPU: recent PyTorch has
-no kernels for it. The script detects this and falls back to CPU, which is slower. Download the zip from the
-notebook's **Output** panel.
+**Kaggle download.** One file at a time via `kagglehub.dataset_download(DATASET_HANDLE, path=<file>)`; each is deleted after
+aggregation (disk stays at ~one file). Local copies (`NCMAPSS_DIR`, `/kaggle/input`, `MyDrive/genzone/`, `/content`,
+`MyDrive/`) are used instead and never deleted. Anonymous download usually works; otherwise add the Colab secrets
+`KAGGLE_USERNAME` and `KAGGLE_KEY` (kaggle.com → Settings → API → Create New Token). Without Kaggle, put the `.h5` files in
+Drive.
 
-**Locally:** this needs the `.h5` files and enough RAM (see section 6). It hasn't been tested end to end outside
-Colab. From the repo root:
-```bash
-pip install -r backend/requirements.txt torch onnx kagglehub matplotlib
-RUN=quick NCMAPSS_DIR=/path/to/h5_folder PYTHONPATH=. python training/ncmapss_colab_training.py
-```
+**Resuming after a disconnect:** re-run all cells. Files already aggregated load from the Drive cache in seconds; the
+rest of the pipeline is recomputed. Delete `MyDrive/genzone/agg_*` (or set `CACHE_AGGREGATES = False`) for a clean run.
 
-### Configuration (cell 1)
+## 4. Configuration
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `RUN` | `"quick"` | `"quick"` = DS02 only; `"full"` = all 10 files |
+| `RUN` | `"quick"` | `"quick"` = DS02; `"full"` = 9 files (DS08d excluded) |
 | `DATA_DIR` | env `NCMAPSS_DIR` | optional folder with the `.h5` files |
-| `DELETE_AFTER_USE` | `True` | delete each downloaded file after aggregation (saves disk) |
-| `HEALTHY_SAMPLES_PER_FILE` | 200 000 | 1 Hz healthy rows per file used to fit the healthy-engine map |
-| `BASELINE_CYCLES` / `ROLL` | 10 / 5 | per-engine healthy baseline window / rolling window for trend features (cycles) |
-| `N_FOLDS` | 5 | GroupKFold **by engine** on the dev engines |
-| `BAND_EDGES` | 0.75 / 0.55 / 0.30 | Normal / Warning / Alarm / Emergency health bands (dashboard) |
-| `USE_CNN` | `True` | train the 1D-CNN on 0.1 Hz in-flight windows |
-| `CNN_EVERY` / `CNN_WINDOW` | 10 / 50 | keep every 10th 1 Hz row (0.1 Hz); window = 50 samples = 500 s of flight |
-| `CNN_EPOCHS` / `CNN_BATCH` / `CNN_LR` / `CNN_SAMPLES_PER_EPOCH` | 20 / 1024 / 1e-3 / 300 000 | CNN training |
-| `STACK_MIN_GAIN` | 0.03 | keep a blend only if its CV RMSE is ≥ 3% better than the best single model |
-| `SMOOTH_GRID` | 1.0 … 0.1 | causal smoothing strengths tried per target (1 = off) |
+| `USE_DRIVE` / `DRIVE_DIR` / `CACHE_AGGREGATES` | `True` / `MyDrive/genzone` / `True` | aggregate cache + bundle copy |
+| `HEALTHY_SAMPLES_PER_FILE` | 200 000 | healthy 1 Hz rows per file for the baseline g(W) |
+| `SEED` | 42 | engine split, sampling, models |
+| `VAL_FRACTION` | 0.2 | share of development engines held out for validation (stratified by subset) |
+| `N_FOLDS` | 5 | engine-grouped folds for out-of-fold predictions and cross-fitting |
+| `ROLL` | 5 | trailing window (flights) of the temporal features |
+| `MERGE_COS` | 0.95 | EKF: merge two states whose sensor signatures are at least this similar |
+| `MERGE_UNIQUE` | 0.15 | EKF: merge a state whose signature is mostly a combination of the others (unique share below this); also the identifiability threshold |
+| `EKF_GATE` | 9.0 | EKF: per-sensor NIS gate (a sensor is rejected for at most 3 flights in a row) |
+| `Q_GRID` | 0.1 … 10 | EKF: process-noise scales tried on validation engines |
+| `TUNE` | `True` | small validation grids for the four models; XGBoost, LightGBM and CatBoost always early-stop on validation |
+| `INTERVAL_LEVEL` | 0.90 | empirical RUL interval from validation residual quantiles |
+| `RELIABLE_MAX_RMSE` / `RELIABLE_MIN_CYCLES` | 0.10 / 30 | health of a component is "ok" only if identifiable and its validation error on degraded flights ≤ 10 points |
+| `EKF_IN_RUL` | `"auto"` | RUL feature set: `"auto"` (validation engines choose), `True` (the spec's full list incl. EKF features), `False` (without EKF features) |
+| `EKF_SELECT_MARGIN` / `EKF_SELECT_MIN_VAL_ENGINES` | 0.02 / 5 | `auto` keeps the full list unless "no EKF" wins on validation by more than the margin, and only chooses at all with at least this many validation engines |
+| `RUN_ABLATION` | `True` | E0–E7 |
+| `RUN_FORECAST` / `FORECAST_HORIZONS` | `True` / `(10, 25, 50)` | EXTENSION: component-health forecasts (section 6) |
+| `FORECAST_DEGRADED_BELOW` | 0.9 | forecasts are scored on flights whose current true health is below this |
+| `RUN_COMPONENT_RUL` | `True` | EXTENSION: component RUL (section 6) |
+| `COMP_FAIL_HI` / `COMP_RUL_CAP` / `COMP_RUL_SHOW_BELOW` | 0.30 / 100 / 0.9 | component failure level (the Emergency band edge); cap in flights; the dashboard shows it only while the EKF health is below this |
+| `SHAP_ROWS` | 300 | training rows explained per model (Random Forest ≤ 100) |
 
----
+## 5. What each step does (and which `pipeline.md` section it implements)
 
-## 3. What the pipeline does (notebook sections)
-
-| § | Step | Details |
+| Step | Implementation | Spec |
 |---|---|---|
-| 3 | **Layer 1: ingestion** | per file and split: read 1 Hz data → **one row per (engine, flight)** with sensor means/stds, physics proxies, flight descriptors, labels, and mean polynomial features of the flight condition. Also keeps a **0.1 Hz copy** for the CNN and samples healthy 1 Hz rows. Engine ids become `file_index*1000 + unit`. |
-| 4 | **Layer 2: physics** | **healthy-engine map**: each sensor as a degree-3 polynomial of (alt, Mach, TRA, T2), fitted on healthy (`hs==1`) dev data. Residual = measured / ideal − 1, which removes the effect of flight conditions. |
-| 4 | **Labels** | damage of component *c* = max(\|eff_mod\|, \|flow_mod\|). **Health index HI_c = 1 − damage_c / D_REF_c**, clipped to [0, 1]. `D_REF_c` = 95th percentile of component *c*'s end-of-life damage over dev engines (**per component**). |
-| 5 | **Layer 3: Kalman filter** | linearised gas-path model, `residuals = b(w) + H(w)·θ + noise`, with influence coefficients scheduled on alt/Mach/TRA. H and b are identified on dev engines, where θ is known. At run time it estimates the 10 health parameters θ **from sensors only**, with 1-σ uncertainty and innovation gating that flags bad sensors. |
-| 6 | **Features** | per engine, causal: z-score, value relative to the engine's own healthy baseline, rolling mean, rolling slope, flight descriptors, cycle number (151 tabular features). CNN inputs: 42 channels per 0.1 Hz sample (flight condition, raw sensors, residuals, that flight's Kalman states), z-scored on dev engines. |
-| 7 | **Tree models** | XGBoost, LightGBM, CatBoost, Random Forest **per target**, with out-of-fold predictions from GroupKFold by engine. Targets: `rul`, `hi_fan`, `hi_lpc`, `hi_hpc`, `hi_hpt`, `hi_lpt`. A target that is constant in training (e.g. fan in DS02) becomes a constant. |
-| 8 | **1D-CNN** | Arias Chao et al.-style network: 3 conv layers (kernel 10, 10/10/1 channels) → dense 50 → 6 outputs, on 500 s windows. Per-flight prediction = mean over the windows ending in that flight. Out-of-fold predictions use the same engine folds. |
-| 9 | **Model choice + smoothing** | per target: non-negative Ridge blend of all models **or** the best single model, decided by **cross-validated** RMSE on dev engines (blend must win by `STACK_MIN_GAIN`). A tree-only fallback is chosen the same way. Then **causal per-engine smoothing** (RUL tracks −1 per flight; health is exponentially smoothed), with strength tuned on dev engines. |
-| 10 | **Evaluation** | on the held-out **test engines** only: RMSE/MAE, NASA score for RUL, per-model and Kalman-only baselines, unsmoothed vs smoothed, **degraded-only errors** (RUL ≤ 20, HI < 0.9), and a naive linear baseline on raw sensors. |
-| 11 | **Uncertainty** | LightGBM quantile models give a RUL 90% interval and its coverage on test engines. |
-| 12 | **Explainability** | TreeSHAP of the tree models, weighted by the blend weights and grouped by physical source; saved as CSV + `shap_summary.png`. |
-| 13 | **Cost** | timings per stage and inference latency. |
-| 14 | **Export** | writes the bundle (below), zips it and downloads it. |
+| **Schema inspection & validation** | `inspect_h5` lists keys/shapes/dtypes/attributes; `load_h5` maps columns **by name**, requires row-aligned groups and drops corrupt rows (non-finite, sensor ≤ 0, unit/cycle < 1); `validate_split` checks engine contiguity and cycle order (hard errors), RUL monotonicity, `hs` values, missing values and ranges (reported). Everything is saved in `schema.json`. | 0.1–0.2, 2.5 |
+| **Flight-end aggregation** | one row per completed flight: per sensor **mean, std, min, max, last value**; flight condition; physics proxies; labels. Telemetry rows are never treated as cycles; flights are never mixed. | 0.3, 3.1–3.2 |
+| **Engine split** | official test engines untouched; validation = 20 % of development engines (fixed seed, stratified by subset); composite ids `file*1000 + unit`. | 0.4, 2.4 |
+| **Healthy baseline g(W)** | degree-3 ridge polynomial of (alt, Mach, TRA, T2) per sensor, fitted on healthy (`hs==1`) rows of **training** engines; residual = measured / healthy − 1. Training-engine residuals are **cross-fitted** (baseline refitted without that engine's fold). Residuals are inspected by altitude band on validation engines. | 3.4, 4.5 |
+| **Physics proxies** | pressure ratios, isentropic efficiency proxies, corrected speeds/flow from measured stations only (HPC uses static Ps30 because P30 is not measured; nothing invented). | 4.3–4.4 |
+| **Reduced-order observation model** | residuals = b(w) + B(w)·x, b and B linear in [1, alt, Mach, TRA], identified on training engines from the 10 hidden parameters (offline use of `T`, 4.7). | 4.6–4.8 |
+| **State selection** | parameters that never move in the training engines are **not estimated** (held at their training value; e.g. 7 of 10 on DS02). The rest: states whose whitened sensor signatures have \|cosine\| ≥ `MERGE_COS` are merged, then any state whose signature is mostly a combination of the others (unique share < `MERGE_UNIQUE`) is merged with its most similar partner. A merged state moves its members along their dominant joint direction. | 4.2, 4.8, 5.4 |
+| **EKF** | random-walk state advanced once per flight; Joseph covariance update; symmetrised; per-sensor NIS gating; R = robust variance of healthy-phase training residuals; Q from training state increments × scale tuned on validation engines (one-step predictive likelihood, no labels); x0/P0 from first flights. Outputs per flight: states + σ, parameter estimates + σ, prior innovations, per-sensor and joint NIS, minimum covariance eigenvalue. | 5.1–5.5 |
+| **Health mapping** | HI = 1 − max(\|eff\|,\|flow\|)/d_ref per component (d_ref = 95th percentile of end-of-life damage on training engines), computed from the **EKF** estimates. Validated against the truth on validation and test engines; components get `reliability` = ok / low / insufficient (decided on validation, needs identifiability). Not an ML target. | 1.1, 4.2 |
+| **Causal features** | blocks: sensor summaries; flight condition; healthy residuals; physics proxies; EKF states; EKF σ; innovations; trailing-window mean/std/min/max/slope of residuals, proxies and states; cycle count, cumulative flight hours, history length. Minimum-history rule: windows use the flights available so far. Missing values → training medians. **Leakage audit** blocks target, hidden parameters, identifiers and `hs`. | 6.1–6.3 |
+| **EKF features in the RUL model?** | the whole RUL pipeline (tuning, out-of-fold, Ridge) is fitted for **two feature sets** and both are reported: **full** (the spec's list) and **no_ekf** (without EKF states, uncertainty and innovations). `EKF_IN_RUL` decides which ships: `"auto"` lets the **validation** engines choose (spec 7.5: tune on validation only) but keeps the spec's full list unless no_ekf wins by more than 2 % and there are at least 5 validation engines (one engine cannot choose reliably); `True` / `False` force it. Test engines never take part. Both results are in `metrics.ekf_in_rul` and the ablation (E4 = full, E5 = no_ekf). | 7.5, rule 9 |
+| **Base models** | Random Forest, XGBoost, LightGBM, CatBoost with the spec's starting configurations; small grids tuned on validation engines; XGBoost, LightGBM and CatBoost early-stop on validation (the number of trees is then frozen for all refits); LightGBM `subsample_freq=1` so `subsample` takes effect. | 7 |
+| **Stacking** | engine-grouped out-of-fold predictions on training engines → StandardScaler fitted on those only → Ridge with alpha chosen on validation → base models refitted on the full training partition. Coefficients unconstrained; alpha, intercept, coefficients, base-prediction correlations and meta residuals are saved. | 8 |
+| **Uncertainty** | EKF covariance (state uncertainty); empirical RUL interval **per predicted-RUL range** (≤ 20, 20–60, > 60) from residual quantiles of the validation engines plus engine-held-out residuals of the whole stack on the training engines (ranges with < 30 residuals use the pooled quantiles); labelled empirical. RUL error by validation engine and degradation phase. Non-negative RUL in the output, raw value kept. | 9 |
+| **Evaluation** | test engines, used once: RMSE, MAE, R², NASA score (late predictions penalised more: e^(d/10)−1 for d>0, e^(−d/13)−1 for d<0); each base model vs the stack; by degradation phase, subset, flight class and engine. | 10.1, 10.3 |
+| **Ablation E0–E7** | section 7 below. | 10.2 |
+| **Explainability** | TreeSHAP of the four models weighted by the Ridge effective weights; importance by feature block; Ridge contributions per model; physics/EKF diagnostics. The backend adds per-prediction SHAP, contributions and occlusion. | 11 |
+| **Bundle** | fingerprints, schema, feature list, engine splits, baseline, EKF (Q/R, x0/P0, states), featurizer (fill medians), four models, Ridge + scaler, interval, diagnostics, tuning table, versions, code commit + hash, metrics. | 13.1 |
 
-**Leakage rules (please keep them):** test engines are never used for fitting, tuning, model choice or smoothing.
-Everything that is fitted (healthy-engine map, `D_REF`, Kalman filter, z-score statistics, models, blend weights,
-smoothing strength) uses dev engines only. All features are **causal**: a flight's prediction only uses that
-flight and earlier ones, so the same code runs in real time.
+## 6. Component-health forecasts (extension beyond `pipeline.md`)
 
-**Team rule:** never train on synthetic or fake data. Unit tests use stub models with fixed formulas; the real
-models are only ever fitted on N-CMAPSS.
+`pipeline.md` makes RUL the only ML target. This optional section (`RUN_FORECAST = True`) also forecasts every component's
+health **h flights ahead** (default 10, 25, 50), one LightGBM model per component and horizon:
 
----
+- **Target:** the true health h flights later **minus the current EKF health estimate** (so a model that learns nothing
+  reproduces "no change"). The future labels come from the hidden parameters `T`, used as targets only.
+- **Inputs:** the same causal features as RUL plus today's EKF health of all five components. Hyperparameters are the
+  ones tuned for the RUL LightGBM model.
+- **Forecast:** current EKF health + predicted change, clipped to [0, 1], with an **empirical interval** from the
+  validation residuals.
+- **Excluded rows:** the last h flights of every engine have no label h flights ahead, so they are neither trained nor
+  scored (long horizons therefore never see an engine's final flights).
+- **Baselines and the "useful" flag:** each forecast is compared with **persistence** (health stays as today) and a
+  **straight-line trend** of the EKF health over the last `ROLL` flights, on flights that are degraded *now*
+  (current true health < `FORECAST_DEGRADED_BELOW`; chosen on the present, never on the outcome). A forecast is marked
+  `useful` only if, on the **validation** engines, it has at least `RELIABLE_MIN_CYCLES` degraded flights and beats both
+  baselines. The dashboard should show only `useful` forecasts.
+- **Limits:** a forecast starts from today's estimate, so components whose EKF reliability is `low` have weaker forecasts.
+  With `RUN="quick"` (DS02) only HPT and LPT degrade, so the other components will mostly be marked not useful. Degradation
+  is slow, so "no change" is hard to beat at short horizons; report what the table shows.
+- **Output:** `forecast_<component>_h<h>.txt` files and a `forecast` entry in the manifest (horizons, features, intervals,
+  `useful`, metrics); the backend adds `fc_<component>_h<h>` (+ `_lo`, `_hi`) columns to every engine payload.
 
-## 4. Output: the model bundle
+### Component RUL (extension)
+
+N-CMAPSS has one RUL per engine and **no per-component remaining life**, so a component RUL is *derived*: from the hidden
+parameters `T` (labels only, offline) we compute when each component's **true** health first falls to `COMP_FAIL_HI`
+(0.30, the Emergency band edge) and train one LightGBM model per component on "flights until that happens", from the same
+causal features as the engine RUL plus today's EKF health of all components.
+
+- **Censoring:** engines whose component never reaches the level have no label and are excluded from training and scoring
+  (the notebook prints how many engines reach it per partition). A prediction only makes sense for a degrading component,
+  so the backend/dashboard should show it only while the EKF health is below `show_below` (0.9).
+- **Baselines and `useful`:** scored on validation and test engines against (1) the **engine RUL used as the component
+  RUL** and (2) a **straight-line extrapolation of the EKF health** to the failure level. A model is `useful` only if, on
+  the validation engines, it has enough flights (≥ `RELIABLE_MIN_CYCLES`), at least 2 engines, and beats both baselines.
+- **Limits:** components that never degrade in the training engines get no model (on DS02 only HPT and LPT degrade). If the
+  EKF cannot separate HPT from LPT (see the observability table), their separate remaining lives are weak: check
+  `ekf_reliability` before presenting a component RUL. Expect it to be less accurate than the engine RUL.
+- **Output:** `component_rul_<component>.txt` files and a `component_rul` manifest entry (level, cap, intervals, `useful`,
+  metrics); the backend adds `crul_<component>` (+ `_lo`, `_hi`) columns to every engine payload.
+
+## 7. Ablation E0–E7
+
+Same engines, folds and hyperparameters; only the features change. "cond" (flight condition and exposure) is in every
+experiment.
+
+| ID | Features | Model | Question |
+|---|---|---|---|
+| E0 | sensor summaries (static) | Random Forest | baseline |
+| E1 | sensor summaries (static) | 4-model stack | does stacking help? |
+| E2 | + healthy residuals (static) | stack | does condition compensation help? |
+| E3 | + physics proxies, EKF states/σ, innovations (static) | Random Forest | physics/EKF features with one model |
+| E4 | everything incl. temporal features | stack | **the full pipeline** |
+| E5 | E4 without EKF features | stack | does the EKF help? (rule 9) |
+| E6 | E4 without physics residuals/proxies/innovations | stack | do physics residuals help? |
+| E7 | E4 without temporal features | stack | do temporal features help? |
+
+**Only claim what this table shows** (`pipeline.md` rule 9): the EKF helps if E5 is clearly worse than E4, and so on.
+
+## 8. Output: the bundle
 
 | File | Content |
 |---|---|
-| `manifest.json` | targets, base models, blend weights / chosen model (`model_choice`), `smoothing`, per-component `d_ref`, feature list, metrics, label summary |
-| `reference.json` / `kf.json` / `featurizer.json` | healthy-engine map, Kalman filter, feature engineering |
-| `<model>_<target>.<ext>` | XGBoost `.json`, LightGBM `.txt`, CatBoost `.cbm`, Random Forest `.joblib` |
-| `cnn.onnx` (+ `cnn.pt`) | the CNN; the backend runs it with onnxruntime |
-| `lightgbm_rul_q05.txt` / `q95.txt` | RUL interval models |
-| `demo_cycles.csv`, `demo_samples.npz` | test engines (per flight and 0.1 Hz) shown in the dashboard |
-| `parity_outputs.csv` | the notebook's own predictions for those engines (for `check_parity`) |
-| `metrics.json`, `versions.json`, `shap_*` | test metrics and timings, library versions, SHAP importance |
+| `manifest.json` | version 4; files, fingerprints, splits, features, d_ref, base models + parameters, interval, observability, EKF diagnostics, health mapping, reliability, tuning, metrics, config, versions, build |
+| `schema.json` | per-file HDF5 inspection and validation reports, variable units, feature blocks |
+| `reference.json` / `ekf.json` / `featurizer.json` / `stack.json` | healthy baseline, EKF, features, scaler + Ridge |
+| `randomforest_rul.joblib`, `xgboost_rul.json`, `lightgbm_rul.txt`, `catboost_rul.cbm` | the four base models |
+| `forecast_<component>_h<h>.txt` | health-forecast models (extension; 15 files with the defaults) |
+| `component_rul_<component>.txt` | component-RUL models (extension; one per degrading component) |
+| `demo_cycles.csv`, `parity_outputs.csv` | test engines for the dashboard; the notebook's predictions for `check_parity` |
+| `per_engine_metrics.csv`, `per_subset_metrics.csv`, `ablation.csv`, `healthy_residuals_by_altitude.csv` | report tables |
+| `metrics.json`, `versions.json`, `shap_importance.csv`, `shap_summary.png` | all metrics and timings, library versions, explanations |
 
-**Installing a bundle:** unzip it into `backend/models/`, then:
-```bash
-python -m backend.check_parity      # backend must reproduce the notebook's predictions -> "PARITY OK"
-python -m backend                   # dashboard at http://localhost:8000
-```
-**Library versions:** load the bundle with the versions in its `versions.json`. Colab currently uses Python 3.13,
-scikit-learn 1.6.1, xgboost 3.4.1, lightgbm 4.6.0 and catboost 1.2.10. Random Forest pickles in particular warn
-across scikit-learn versions.
+Load the bundle with the library versions in its `versions.json` (Colab currently: Python 3.13, scikit-learn 1.6.1).
 
----
+## 9. Time and resources
 
-## 5. Current results
+**Measured** on the first quick run (Colab CPU, DS02, before early stopping for LightGBM/CatBoost): total **45 min** -
+download + aggregation 3.5 min, baseline + EKF 0.1 min, four models (tuning + out-of-fold + final) **14 min**, ablation
+**27 min**, forecasts 0.2 min, SHAP 0.1 min. CatBoost (800 trees) took ~1 min per fit and dominated.
 
-The bundle currently in `backend/models/` comes from a **full run with DS01–DS07, before the CNN, per-component
-health scale and smoothing were added**: 29 test engines, 2,318 test flights.
+Early stopping on validation now cuts the trees of all three boosted models (XGBoost already stopped at 83 of 800 on
+DS02), so the times below are **estimates** until the next run prints `timings_s`:
 
-| RUL (test engines) | RMSE (flights) | MAE |
+| | Quick (DS02) | Full (9 files) |
 |---|---|---|
-| Blend (trees + GRU, since removed) | 7.49 | 5.49 |
-| Random Forest alone | 7.51 | 5.49 |
-| Naive linear on raw sensor means | 15.07 | 12.07 |
-| Blend, last 20 flights only | **1.98** | 1.42 |
-| Blend, RUL > 60 (early life) | 9.16 | 7.46 |
+| Download + validation + aggregation | ~3.5 min (seconds from cache) | ~13–15 min (~1 min from cache) |
+| Baseline + EKF + features | < 1 min | ~3–6 min |
+| Four models: tuning + out-of-fold + final | ~3–6 min | ~20–45 min |
+| Ablation (5 stacks + 2 RF) | ~6–12 min | ~45–90 min |
+| Forecasts + component RUL (extensions) + SHAP + export | ~1 min | ~5–10 min |
+| **Total** | **~15–25 min** | **~1.5–2.5 h** |
 
-| Health on **degraded flights** (HI < 0.9), in points out of 100 | ML RMSE | Kalman filter alone |
-|---|---|---|
-| HPT | 2.3 | 4.5 |
-| HPC | 3.3 | 4.9 |
-| LPT | 5.4 | 9.2 |
-| Fan | 7.1 | 6.3 |
-| LPC | 24.7 | 17.1 |
+RAM: peak ~5 GB while aggregating the largest file (Colab standard is enough). Disk: ~4 GB at a time. Drive: < 1 GB.
+If time is short: `RUN_ABLATION = False` (report it), or `TUNE = False`. Free Colab disconnects idle sessions; keep the tab
+active (the aggregation cache survives a disconnect, the rest is recomputed).
 
-The RUL 90% interval covers 83% (too narrow). The run took about 31 minutes on Colab T4 (download + aggregate 9 min,
-trees 18 min, SHAP 2.5 min).
+## 10. Reading the results
 
-**Reference point:** Arias Chao et al. (RESS 2022, "Fusing physics-based and deep learning models for prognostics")
-report RUL RMSE 4.95 (CNN, sensors only) and 4.14 (hybrid, perfect calibration) on the **same DS02 test engines
-(units 11, 14, 15)** that `RUN="quick"` evaluates. Our quick run scored 8.21 before the CNN. Comparing against those
-numbers is the main purpose of the CNN.
+- **RUL:** RMSE in cycles, plus the split by degradation phase; end-of-life error matters most, early-life error is
+  largely irreducible. Compare the stack with each base model: `pipeline.md` 7.5 says not to assume the ensemble wins.
+- **Ablation:** decides which claims are allowed.
+- **Component health:** read the health-mapping table and `reliability`; components marked `low` / not identifiable must
+  be shown as low-confidence (or merged), not as a component health percentage (`pipeline.md` 1.1).
+- **Forecasts:** read the forecast table (RMSE in health points vs persistence and trend, skill, `useful`). A forecast
+  that does not beat persistence on validation is not shown; say so rather than present it.
+- **EKF consistency:** mean joint NIS on validation engines near the number of sensors (14), small gated share,
+  covariance eigenvalues ≥ 0.
 
----
+### EKF features and RUL (read this before claiming anything about the EKF)
 
-## 6. Runtime and resources
+On the DS02 quick runs the RUL model was **better without the EKF features** (E5 beat E4 by ~1.1 flights, R² 0.90 vs
+0.865). `pipeline.md` rule 9 says the EKF may only be claimed to help RUL if E5 is worse than E4, so on DS02 that claim
+cannot be made. The EKF's role in this project is **component health, its uncertainty and sensor checks**, not RUL
+accuracy. Likely cause: the EKF states are functions of the same residuals the models already see, so they add features
+(265 vs 237) without information, and with 5 training engines extra features overfit. Whether this holds on the full
+dataset is decided by the full run: `metrics.ekf_in_rul` and ablation E4 vs E5 report both versions, `EKF_IN_RUL = "auto"`
+ships the one the validation engines prefer (the spec's full list when in doubt). Do not choose by test results.
 
-| | Quick (DS02) | Full (10 files) |
-|---|---|---|
-| Download + aggregation | a few minutes | ~13–15 min (9 min for 7 files) |
-| RAM peak | ~4 GB | ~5 GB per file load + ~3–4 GB for 0.1 Hz CNN data (Colab standard 12.7 GB is enough) |
-| Disk | ~3 GB | ~4 GB at a time (each file deleted after use) |
-| Trees (6 targets × 4 models × 6 fits) | minutes | ~20 min |
-| CNN (6 trainings) | minutes on T4 | estimated 10–20 min on T4, much longer on CPU |
+### First quick run (DS02, before the three fixes)
 
-Full-run times with the CNN and DS08 are estimates; the first such run will give the real numbers in `timings_s`.
-
----
-
-## 7. Troubleshooting
-
-| Symptom | Cause / fix |
+| | Test RUL RMSE (flights) |
 |---|---|
-| `OSError: Unable to synchronously open file (truncated file: eof = 2885034848 ... stored_eof = 2885034880)` | Kaggle's `DS08d-010.h5` is 32 bytes short; re-downloading doesn't help. The current script repairs a copy automatically (`repair_truncated_h5`, at most 4 KB missing) and drops any zeroed rows. Update to the latest notebook. |
-| `OSError: [Errno 30] Read-only file system: '/kaggle/input/...'` | old notebook on Kaggle tried to delete the input; fixed in the current version. |
-| `Could not download ... from Kaggle` | add `KAGGLE_USERNAME` / `KAGGLE_KEY` Colab secrets, or use Drive + `NCMAPSS_DIR`. |
-| `CUDA GPU not usable with this PyTorch build` | old GPU (e.g. Kaggle P100); it trains on CPU. Switch to T4. |
-| `WARNING: CNN ONNX export failed` | `onnx`/`onnxruntime` missing; the bundle then serves the tree-only blend. Install them and re-run the export cell. |
-| `NOTE: <component> health barely varies` | expected with `RUN="quick"`; use `RUN="full"`. |
-| Out of memory | use High-RAM, or lower `HEALTHY_SAMPLES_PER_FILE` / raise `CNN_EVERY`. |
-| `check_parity` reports MISMATCH | library versions differ from `versions.json`, or the bundle and code are from different commits. |
-| Colab disconnects | free Colab drops idle sessions after ~90 min; keep the tab active. |
+| Ridge stack (pipeline) | **7.10** (R² 0.875) |
+| best single model (Random Forest) | 6.41 |
+| old pipeline, same engines | 8.21 |
+| Arias Chao et al.: CNN sensors only / hybrid | 4.95 / 4.14 |
 
----
+- **Ablation:** healthy-baseline residuals are the big gain (raw sensors 18.1 → 7.6; removing residuals → 14.0). Removing
+  the EKF features *improved* RUL (6.47) and so did removing temporal features (6.71): on DS02 the EKF does not help RUL,
+  so that claim cannot be made from this run.
+- **Bias:** predictions are pulled toward the middle (+6 flights at end of life, −10 early). The stack is ≈ 2.9 + 0.915 ×
+  the average model, which explains part of it.
+- **Validation:** DS02 has only 6 development engines → 1 validation engine; it chose settings poorly (the raw-sensor
+  model had the best validation and worst test score) and the interval covered only 61 %. The full run has ~10.
+- **EKF:** 7 of 10 parameters never move in DS02 (now excluded); HPT and LPT are not separable on these engines (now
+  merged and shown low-confidence). Health error on degrading test flights: HPT 18.5, LPT 23 points.
+- **Forecasts:** none marked useful (no degradation for fan/LPC/HPC; too few degraded validation flights for HPT/LPT).
 
-## 8. Open work (good next tasks)
+## 11. Deviations from `pipeline.md` (documented)
 
-1. **First run with the CNN.** Do `RUN="quick"` first and compare with the paper (4.95 / 4.14), then `RUN="full"`.
-2. **Physics ablation:** the same Random Forest on raw sensors → + residuals → + Kalman states → full features, to
-   quantify what the physics layers add (the project's main claim).
-3. **Kalman health as a candidate model per component.** For fan and LPC, the Kalman filter alone currently beats
-   the ML.
-4. **LPC accuracy:** fan and LPC are confused (both upstream of T24/P24). Try better proxies and per-flight-phase
-   (steady high-power) residuals.
-5. **Calibrate the RUL interval** (83% → 90% coverage), e.g. on cross-validated errors.
-6. **Diagnosis metric:** how often the weakest predicted component is the truly degrading one.
-7. **Sensor-fault robustness test:** perturb one sensor on real test engines and show that the Kalman filter's gating
-   keeps health estimates stable.
+| Spec | What we do | Why |
+|---|---|---|
+| "EKF" with a candidate 4-state vector | observation model linear in the state (EKF update exact); state vector = the 10 N-CMAPSS parameters, merged by observability analysis | data-driven state selection instead of guessing which states are identifiable |
+| Repeated engine-level splits (10.3, "where feasible") | one fixed split | Colab time budget; the validation fraction and seed are configurable |
+| (none: RUL is the only ML target) | **component-health forecasts** and **component RUL** added as optional extensions (section 6) | requested for the dashboard; kept separate so the spec pipeline is unchanged; `RUN_FORECAST = False` / `RUN_COMPONENT_RUL = False` remove them |
+| Backend API names (`/health`, `/ready`, `/api/v1/...`), frontend reconnect/stale indicator (12) | not part of training | separate backend/frontend work |
 
----
+## 12. Troubleshooting
 
-## 9. Tests
+| Symptom | Fix |
+|---|---|
+| `Could not download ... from Kaggle` | add `KAGGLE_USERNAME` / `KAGGLE_KEY` Colab secrets, or put the files in Drive |
+| `truncated file: eof = 2885034848 ...` / `free block size is zero?` | Kaggle's DS08d-010 is damaged; it is excluded from `FILES` - do not add it back |
+| `ValueError: ... not row-aligned` / `not contiguous` / `cycle numbers go backwards` | the file violates an assumption the pipeline depends on; send the message (do not bypass) |
+| `NOTE [...]: dropped N corrupt rows` | informational; corrupt rows were removed |
+| Drive prompt fails | `USE_DRIVE = False` |
+| Out of memory | High-RAM runtime or lower `HEALTHY_SAMPLES_PER_FILE` |
+| `check_parity` MISMATCH | library versions differ from `versions.json`, or bundle and code are from different commits |
+| Dashboard: "Unsupported bundle version 3" | that is the old pipeline's bundle; install a bundle from this notebook |
+
+## 13. Tests
 
 ```bash
-python -m pytest backend/tests        # pipeline maths, Kalman filter, encoder, smoothing, bundle loading, API
+python -m pytest backend/tests
 ```
-The tests use **stub** models (fixed formulas, no training), so they check plumbing, not accuracy. Accuracy is
-measured only by the notebook's test-engine evaluation.
+Hand-set parameters and stub learners (nothing is fitted on synthetic data) check the plumbing: schema validation,
+aggregation, baseline maths, EKF (tracking, gating, PSD, Jacobian vs finite differences, state merging, diagnostics),
+features (window statistics, causality, leakage audit), stacking (engine splits, out-of-fold correctness, Ridge
+algebra, metrics, interval, forecast labels/baselines/metrics), the backend and API (including forecast columns), and the notebook's Layer 1 and engine-split cells on a tiny synthetic
+file. Accuracy is measured only by the notebook's evaluation on real test engines.

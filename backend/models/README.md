@@ -4,22 +4,27 @@
 (so `backend/models/manifest.json` exists) and restart the backend. Then run `python -m backend.check_parity` once:
 it re-computes the bundled test engines and compares them with the notebook's own predictions.
 
+Only version-4 bundles (pipeline.md pipeline) load. The previous pipeline's bundle is kept for reference in
+`docs/genzone_ncmapss_full_bundle/` and is not loadable by the current backend.
+
 ## Files
 
 | File | Content |
 |---|---|
-| `manifest.json` | version 3: targets, base models, blend weights / chosen model, smoothing, per-component d_ref, features, band edges, metrics |
-| `reference.json` | Layer 2 healthy-engine map (polynomial coefficients per sensor) |
-| `kf.json` | Layer 3 Kalman filter (influence coefficients H, bias b, noise R/Q, initial state) |
-| `featurizer.json` | causal feature engineering (z-score stats, baseline window, feature order) |
-| `<model>_<target>.<ext>` | XGBoost `.json`, LightGBM `.txt`, CatBoost `.cbm`, RandomForest `.joblib` per target |
-| `cnn.onnx` (+ `cnn.pt`) | multi-output 1D-CNN (RUL + 5 component health indices) on 500 s windows of 0.1 Hz data |
-| `demo_samples.npz` | 0.1 Hz flight condition + sensors of the test engines (CNN input for the dashboard) |
-| `lightgbm_rul_q05.txt`, `q95.txt` | RUL quantile models (90% interval) |
-| `demo_cycles.csv` | per-cycle aggregates of the held-out test engines (shown in the dashboard) |
+| `manifest.json` | version 4: files + fingerprints, engine splits, features, d_ref, base models + parameters, interval, observability, EKF diagnostics, health mapping, reliability, tuning, metrics, config, versions, build |
+| `schema.json` | per-file HDF5 inspection/validation reports, variable units, feature blocks |
+| `reference.json` | healthy-condition baseline g(W) (polynomial coefficients per sensor) |
+| `ekf.json` | EKF: observation model b, B, state groups/loadings, R, Q (+ scale), x0, P0, gate |
+| `manifest.json` → `model_features` | the columns the RUL models use (a subset of `features` when the EKF features were left out, see `metrics.ekf_in_rul`) |
+| `featurizer.json` | causal features (temporal bases, static columns, window, training-median fill values) |
+| `stack.json` | Ridge meta-learner + the scaler fitted on out-of-fold predictions |
+| `randomforest_rul.joblib`, `xgboost_rul.json`, `lightgbm_rul.txt`, `catboost_rul.cbm` | the four base models |
+| `forecast_<component>_h<h>.txt` | optional health-forecast models (extension; the manifest's `forecast` entry lists horizons, intervals, `useful`) |
+| `component_rul_<component>.txt` | optional component-RUL models (extension; the manifest's `component_rul` entry lists the failure level, cap, intervals, `useful`) |
+| `demo_cycles.csv` | per-flight aggregates of the held-out test engines (shown in the dashboard) |
 | `parity_outputs.csv` | the notebook's predictions for those engines (used by `check_parity`) |
-| `shap_*.csv`, `shap_summary.png` | global TreeSHAP importance per target |
-| `metrics.json`, `versions.json` | test metrics, timings, library versions |
+| `per_engine_metrics.csv`, `per_subset_metrics.csv`, `ablation.csv`, `healthy_residuals_by_altitude.csv` | result tables |
+| `metrics.json`, `versions.json`, `shap_importance.csv`, `shap_summary.png` | metrics + timings, library versions, explanations |
 
-Targets: `rul` (cycles) and `hi_fan`, `hi_lpc`, `hi_hpc`, `hi_hpt`, `hi_lpt` (1 = healthy, 0 = failure-level
-damage). Library versions on the backend should match `versions.json`.
+ML target: `rul` (flight cycles). Component health (`hi_*`, 1 = healthy, 0 = failure-level damage) comes from the EKF.
+Library versions on the backend should match `versions.json`.

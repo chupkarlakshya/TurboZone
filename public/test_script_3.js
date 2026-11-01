@@ -1611,7 +1611,7 @@ function renderComponents(i) {
       </div>
       <div class="flex-1 min-w-0">
         <div class="flex justify-between text-[11px] font-label-sm"><span class="font-bold text-on-surface">${COMP_LABEL[cc]}</span><span style="color:${bandColorRaw(hi)}">${bandLabel(hi)}</span></div>
-        <div class="text-[10px] font-label-sm text-on-surface-variant truncate">ML ${fmtN(hi,2)} ±${fmtN(d.spread[cc],2)} · KF ${fmtN(d.kf[cc],2)} ±${fmtN(d.kfs[cc],2)}${isFinite(truth) ? ' · true ' + fmtN(truth,2) : ''}</div>
+        <div class="text-[10px] font-label-sm text-on-surface-variant truncate">EKF ${fmtN(hi,2)} ±${fmtN(d.spread[cc],2)} (1σ)${isFinite(truth) ? ' · true ' + fmtN(truth,2) : ''}</div>
         <svg id="spark-${cc}" class="w-full h-4"></svg>
       </div>
     </div>`;
@@ -2101,7 +2101,7 @@ function renderExplanation(ex, target) {
   const omax = Math.max(1e-9, ...occ.map(r => Math.abs(r.value)));
   let html = `<div class="text-[11px] font-label-sm mb-2">Prediction: <b>${ex.prediction.toFixed(dp)}${unit}</b>
     <span class="text-on-surface-variant">(red = pushes ${target === 'rul' ? 'RUL' : 'health'} down)</span></div>
-    <div class="text-[10px] font-label-sm text-on-surface-variant mb-1">Full stack incl. GRU &amp; Kalman filter — occlusion per sensor</div>`;
+    <div class="text-[10px] font-label-sm text-on-surface-variant mb-1">Whole pipeline incl. EKF — occlusion per sensor</div>`;
   html += occ.map(r => `<div class="mb-1.5"><div class="flex justify-between text-[11px] font-label-sm">
       <span class="truncate text-on-surface-variant" title="${r.description}">${r.sensor} · ${r.description}</span>
       <span class="font-data-display shrink-0 ml-2 whitespace-nowrap">${r.value >= 0 ? '+' : ''}${r.value.toFixed(dp)}${unit}</span></div>${bar(r.value, omax)}</div>`).join('');

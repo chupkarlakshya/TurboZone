@@ -1,0 +1,661 @@
+<!DOCTYPE html><html class="light" lang="en" style="width: 100%; height: 100%;">
+<head>
+<meta charset="utf-8">
+<meta content="width=device-width, initial-scale=1.0" name="viewport">
+<title>GENZONE | Turbofan Digital Twin (N-CMAPSS) - AI Manthan</title>
+<!-- Material Symbols -->
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet">
+<!-- Google Fonts: Hanken Grotesk & JetBrains Mono -->
+<link href="https://fonts.googleapis.com" rel="preconnect">
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect">
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;600;700&amp;family=JetBrains+Mono:wght@500;600&amp;display=swap" rel="stylesheet">
+<!-- Tailwind CSS -->
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<!-- Tailwind Configuration -->
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "surface-container-low": "#eff4ff",
+                        "on-surface": "#0d1c2e",
+                        "surface-container": "#e6eeff",
+                        "on-tertiary-fixed": "#2a1700",
+                        "inverse-surface": "#233144",
+                        "on-secondary-fixed": "#002113",
+                        "on-tertiary-fixed-variant": "#653e00",
+                        "primary": "#006591",
+                        "tertiary-container": "#d88a00",
+                        "surface-bright": "#f8f9ff",
+                        "secondary-fixed": "#6ffbbe",
+                        "on-background": "#0d1c2e",
+                        "tertiary-fixed-dim": "#ffb95f",
+                        "inverse-on-surface": "#eaf1ff",
+                        "error": "#ba1a1a",
+                        "surface-container-high": "#dce9ff",
+                        "on-primary-container": "#003751",
+                        "on-tertiary-container": "#4a2c00",
+                        "on-primary-fixed-variant": "#004c6e",
+                        "surface-tint": "#006591",
+                        "primary-fixed-dim": "#89ceff",
+                        "error-container": "#ffdad6",
+                        "secondary-fixed-dim": "#4edea3",
+                        "on-secondary": "#ffffff",
+                        "background": "#f8f9ff",
+                        "on-error": "#ffffff",
+                        "on-tertiary": "#ffffff",
+                        "primary-fixed": "#c9e6ff",
+                        "secondary": "#006c49",
+                        "surface-container-highest": "#d5e3fc",
+                        "surface-variant": "#d5e3fc",
+                        "secondary-container": "#6cf8bb",
+                        "surface": "#f8f9ff",
+                        "surface-container-lowest": "#ffffff",
+                        "outline-variant": "#bec8d2",
+                        "on-secondary-fixed-variant": "#005236",
+                        "on-surface-variant": "#3e4850",
+                        "on-error-container": "#93000a",
+                        "primary-container": "#0ea5e9",
+                        "inverse-primary": "#89ceff",
+                        "on-secondary-container": "#00714d",
+                        "on-primary-fixed": "#001e2f",
+                        "on-primary": "#ffffff",
+                        "surface-dim": "#ccdbf3",
+                        "tertiary": "#855300",
+                        "tertiary-fixed": "#ffddb8",
+                        "outline": "#6e7881"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    "spacing": {
+                        "lg": "24px",
+                        "md": "16px",
+                        "margin": "32px",
+                        "sm": "8px",
+                        "xs": "4px",
+                        "base": "4px",
+                        "gutter": "20px",
+                        "xl": "48px"
+                    },
+                    "fontFamily": {
+                        "body-md": ["Hanken Grotesk"],
+                        "headline-lg-mobile": ["Hanken Grotesk"],
+                        "headline-md": ["Hanken Grotesk"],
+                        "headline-sm": ["Hanken Grotesk"],
+                        "label-sm": ["JetBrains Mono"],
+                        "headline-lg": ["Hanken Grotesk"],
+                        "data-display": ["JetBrains Mono"],
+                        "body-lg": ["Hanken Grotesk"]
+                    },
+                    "fontSize": {
+                        "body-md": ["14px", { "lineHeight": "20px", "fontWeight": "400" }],
+                        "headline-lg-mobile": ["26px", { "lineHeight": "32px", "fontWeight": "700" }],
+                        "headline-md": ["24px", { "lineHeight": "32px", "fontWeight": "600" }],
+                        "headline-sm": ["18px", { "lineHeight": "24px", "fontWeight": "600" }],
+                        "label-sm": ["11px", { "lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "500" }],
+                        "headline-lg": ["32px", { "lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700" }],
+                        "data-display": ["20px", { "lineHeight": "28px", "fontWeight": "600" }],
+                        "body-lg": ["16px", { "lineHeight": "24px", "fontWeight": "400" }]
+                    },
+                    "animation": {
+                        'fade-in-up': 'fadeInUp 0.5s ease-out forwards',
+                        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                    },
+                    "keyframes": {
+                        fadeInUp: {
+                            '0%': { opacity: '0', transform: 'translateY(10px)' },
+                            '100%': { opacity: '1', transform: 'translateY(0)' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        /* Custom scrollbar for webkit */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f8f9ff;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #bec8d2;
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #6e7881;
+        }
+        
+        .card-shadow {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
+        }
+        
+        .data-card {
+            background-color: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 0.5rem;
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%);
+        }
+        
+        .data-header {
+            background-color: rgba(248, 250, 252, 0.8);
+            backdrop-filter: blur(8px);
+            border-bottom: 1px solid #E2E8F0;
+            padding: 8px 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .gauge-svg {
+            transform: rotate(-90deg);
+            filter: drop-shadow(0 4px 6px rgba(0,0,0,0.05));
+        }
+        .gauge-track {
+            fill: none;
+            stroke: #E2E8F0;
+            stroke-width: 8;
+        }
+        .gauge-fill-primary {
+            fill: none;
+            stroke: url(#primary-gradient);
+            stroke-width: 8;
+            stroke-linecap: round;
+            stroke-dasharray: 251.2; /* 2 * pi * r (r=40) */
+            transition: stroke-dashoffset 1s ease-out;
+            filter: drop-shadow(0px 2px 4px rgba(14, 165, 233, 0.4));
+        }
+        .gauge-fill-success {
+            fill: none;
+            stroke: url(#success-gradient);
+            stroke-width: 8;
+            stroke-linecap: round;
+            stroke-dasharray: 251.2;
+            transition: stroke-dashoffset 1s ease-out, stroke 0.3s ease;
+            filter: drop-shadow(0px 2px 4px rgba(16, 185, 129, 0.4));
+        }
+        
+        .gauge-fill-warning {
+            fill: none;
+            stroke: url(#warning-gradient);
+            stroke-width: 8;
+            stroke-linecap: round;
+            stroke-dasharray: 251.2;
+            transition: stroke-dashoffset 1s ease-out, stroke 0.3s ease;
+            filter: drop-shadow(0px 2px 4px rgba(245, 158, 11, 0.4));
+        }
+
+        .gauge-fill-error {
+            fill: none;
+            stroke: url(#error-gradient);
+            stroke-width: 8;
+            stroke-linecap: round;
+            stroke-dasharray: 251.2;
+            transition: stroke-dashoffset 1s ease-out, stroke 0.3s ease;
+            filter: drop-shadow(0px 2px 4px rgba(239, 68, 68, 0.4));
+        }
+        
+        /* Specific delays for staggered animation */
+        .delay-100 { animation-delay: 100ms; }
+        .delay-200 { animation-delay: 200ms; }
+        .delay-300 { animation-delay: 300ms; }
+        .delay-400 { animation-delay: 400ms; }
+
+        #compCard:not(.show) {
+            display: none !important;
+        }
+
+        /* Gauge value overlays (HI + uncertainty stacked, centered) */
+        #val-comp, #val-comb, #val-turb {
+            display: flex; flex-direction: column; align-items: center;
+            line-height: 1.1; white-space: nowrap; overflow: visible;
+            padding-top: 14px;
+        }
+        .gauge-uncert {
+            font-size: 9px; font-weight: 500; opacity: 0.7;
+            font-family: 'JetBrains Mono', monospace; margin-top: 1px;
+        }
+        #ohiNum { display: flex; flex-direction: column; align-items: center; line-height: 1.1; overflow: visible; }
+        .unit { margin-left: 3px; font-size: 12px; font-weight: 400; color: #6e7881; }
+
+        /* Brayton summary + efficiency cards */
+        .brayton-summary-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+        .brayton-summary-item { display: flex; flex-direction: column; min-width: 0; }
+        .bs-label { font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; color: #6e7881; font-family: 'JetBrains Mono', monospace; }
+        .bs-val { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 600; white-space: nowrap; }
+        .bs-val.ideal { color: #0284c7; }
+        .bs-val.actual { color: #059669; }
+        .eff-card { border: 1px solid #E2E8F0; border-radius: 6px; padding: 8px 10px; background: #fff; min-width: 0; }
+        .eff-label { font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; color: #6e7881; font-family: 'JetBrains Mono', monospace; margin-bottom: 4px; }
+        .eff-vals { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-family: 'JetBrains Mono', monospace; }
+        .eff-ideal { font-size: 12px; font-weight: 600; color: #0284c7; }
+        .eff-actual { font-size: 12px; font-weight: 600; color: #059669; }
+        .eff-delta { font-size: 10px; color: #D97706; }
+        .eff-bar-track { position: relative; width: 100%; height: 5px; background: #E2E8F0; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+        .eff-bar-ideal, .eff-bar-actual { position: absolute; top: 0; left: 0; height: 100%; border-radius: 3px; }
+        .eff-bar-ideal { background: rgba(14,165,233,0.35); }
+        .eff-bar-actual { background: #10B981; }
+
+        /* Station table */
+        #braytonTableBody td { padding: 8px 12px; white-space: nowrap; }
+        #braytonTableBody tr + tr td { border-top: 1px solid #E2E8F0; }
+        .loss-col { color: #DC2626; }
+        .ideal-col { color: #0284c7; }
+        .actual-col { color: #059669; }
+
+        /* Overlay card metrics */
+        .m-label { color: #6e7881; }
+        .m-val { text-align: right; font-weight: 600; color: #0d1c2e; }
+    </style>
+    
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body class="bg-surface font-body-md text-on-surface h-screen overflow-hidden flex relative">
+<!-- Shared Gradients -->
+<svg aria-hidden="true" class="absolute hidden" height="0" width="0">
+<defs>
+<linearGradient id="primary-gradient" x1="0%" x2="100%" y1="0%" y2="100%">
+<stop offset="0%" stop-color="#38bdf8"></stop>
+<stop offset="100%" stop-color="#0284c7"></stop>
+</linearGradient>
+<linearGradient id="success-gradient" x1="0%" x2="100%" y1="0%" y2="100%">
+<stop offset="0%" stop-color="#34d399"></stop>
+<stop offset="100%" stop-color="#059669"></stop>
+</linearGradient>
+<linearGradient id="warning-gradient" x1="0%" x2="100%" y1="0%" y2="100%">
+<stop offset="0%" stop-color="#fbbf24"></stop>
+<stop offset="100%" stop-color="#d97706"></stop>
+</linearGradient>
+<linearGradient id="error-gradient" x1="0%" x2="100%" y1="0%" y2="100%">
+<stop offset="0%" stop-color="#f87171"></stop>
+<stop offset="100%" stop-color="#dc2626"></stop>
+</linearGradient>
+</defs>
+</svg>
+<!-- SideNavBar -->
+<nav class="fixed left-0 top-0 h-full w-[280px] bg-surface-container-low border-r border-outline-variant flex flex-col z-20 hidden md:flex shadow-xl shadow-surface-container-low/50">
+<!-- Header -->
+<div class="p-lg border-b border-outline-variant flex items-center gap-md bg-gradient-to-b from-white/50 to-transparent">
+<div class="w-10 h-10 rounded-full bg-gradient-to-br from-primary-container to-primary/20 flex items-center justify-center text-on-primary-container font-headline-sm font-bold shadow-inner">
+                E
+            </div>
+<div class="flex-1">
+<select class="engine-select text-xs font-headline-sm text-primary font-bold tracking-tight bg-white/80 border border-outline-variant/60 rounded px-2 py-1 shadow-sm w-full cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary">
+  <option value="">Loading engines…</option>
+</select>
+<p id="engine-subtitle" class="text-[11px] font-label-sm text-on-surface-variant mt-0.5">Two-spool turbofan · N-CMAPSS</p>
+</div>
+</div>
+<!-- Tabs -->
+<div class="flex-1 py-md overflow-y-auto">
+<ul class="space-y-xs px-sm">
+<li class="">
+<a id="nav-overview" class="nav-item active flex items-center gap-md bg-gradient-to-r from-primary-container to-primary/10 text-on-primary-container rounded-lg mx-2 px-4 py-3 font-label-sm text-label-sm transition-all duration-200 ease-in-out shadow-sm border border-primary/10" href="javascript:void(0);">
+<span class="material-symbols-outlined text-[20px] drop-shadow-sm text-primary" style="font-variation-settings: &quot;FILL&quot; 1;">dashboard</span>
+<span class="">Overview</span>
+</a>
+</li>
+<li class="">
+<a id="nav-physics" class="nav-item flex items-center gap-md text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest px-4 py-3 mx-2 rounded-lg font-label-sm text-label-sm transition-all duration-200 ease-in-out" href="javascript:void(0);">
+<span class="material-symbols-outlined text-[20px] opacity-70">science</span>
+<span class="">Physics Modules</span>
+</a>
+</li>
+</ul>
+</div>
+<!-- CTA & Footer -->
+<div class="p-lg border-t border-outline-variant space-y-md bg-gradient-to-t from-primary/5 to-transparent">
+<button id="upload-csv-btn" class="w-full bg-gradient-to-r from-primary to-surface-tint text-on-primary hover:opacity-90 font-headline-sm text-sm py-4 rounded-lg flex items-center justify-center gap-2 transition-colors shadow-lg shadow-primary/20 border border-primary/20">
+<span class="material-symbols-outlined text-[20px] drop-shadow-sm">upload</span>
+                UPLOAD CSV
+            </button>
+<ul class="pt-sm space-y-xs">
+<li class="">
+<a class="flex items-center gap-md text-on-surface-variant hover:text-on-surface px-4 py-2 font-label-sm text-label-sm transition-colors" href="javascript:void(0);">
+<span class="material-symbols-outlined text-[18px] opacity-70">menu_book</span>
+                        Documentation
+                    </a>
+</li>
+<li class="">
+<a class="flex items-center gap-md text-on-surface-variant hover:text-on-surface px-4 py-2 font-label-sm text-label-sm transition-colors" href="javascript:void(0);">
+<span class="material-symbols-outlined text-[18px] opacity-70">contact_support</span>
+                        Support
+                    </a>
+</li>
+</ul>
+</div>
+</nav>
+<!-- Main Content Area -->
+<div class="flex-1 flex flex-col md:ml-[280px] h-full relative z-10">
+<!-- TopAppBar -->
+<header class="w-full px-lg py-sm bg-surface-container-lowest/90 backdrop-blur-md flex justify-between items-center border-b border-outline-variant z-20 shadow-sm">
+<!-- Mobile Menu Toggle & Brand -->
+<div class="flex items-center gap-md">
+<button class="md:hidden text-on-surface-variant p-1">
+<span class="material-symbols-outlined">menu</span>
+</button>
+<div class="text-headline-sm font-headline-sm font-bold tracking-tight text-on-surface flex items-center gap-2">
+<span class="material-symbols-outlined text-primary drop-shadow-sm" style="font-variation-settings: &quot;FILL&quot; 1;">toys</span>
+                    TURBOFAN DIGITAL TWIN
+                </div>
+</div>
+<!-- Global Nav -->
+<nav class="hidden lg:flex items-center gap-lg h-full">
+<a class="global-nav-item text-on-surface-variant hover:text-on-surface transition-colors font-label-sm text-label-sm h-full flex items-center border-b-2 border-transparent" href="javascript:void(0);" data-target="inlet">Fan</a>
+<a class="global-nav-item text-on-surface-variant hover:text-on-surface transition-colors font-label-sm text-label-sm h-full flex items-center border-b-2 border-transparent" href="javascript:void(0);" data-target="compressor">Compressor</a>
+<a class="global-nav-item text-on-surface-variant hover:text-on-surface transition-colors font-label-sm text-label-sm h-full flex items-center border-b-2 border-transparent" href="javascript:void(0);" data-target="combustor">Burner</a>
+<a class="global-nav-item text-on-surface-variant hover:text-on-surface transition-colors font-label-sm text-label-sm h-full flex items-center border-b-2 border-transparent" href="javascript:void(0);" data-target="turbine">Turbine</a>
+<a class="global-nav-item text-on-surface-variant hover:text-on-surface transition-colors font-label-sm text-label-sm h-full flex items-center border-b-2 border-transparent" href="javascript:void(0);" data-target="physics">Physics</a>
+</nav>
+<!-- Trailing Actions -->
+<div class="flex items-center font-label-sm text-xs text-primary font-bold">
+    CYCLE <input type="number" id="cycleInput" class="ml-2 w-16 bg-surface-container-low font-data-display text-lg border border-outline-variant/50 rounded text-center" value="1"> <span id="maxCycleSpan"> / 250</span>
+</div>
+</header>
+<!-- Dashboard Canvas -->
+<main class="flex-1 overflow-y-auto p-4 md:p-margin bg-gradient-to-br from-surface to-surface-container-low relative">
+<div id="no-bundle" class="absolute inset-0 z-30 items-start justify-center pt-24 bg-surface/95 backdrop-blur-sm" style="display:none">
+<div class="max-w-lg bg-white border border-outline-variant/60 rounded-xl shadow-xl p-6 text-sm">
+<div class="font-headline-sm text-primary mb-2">No trained model bundle loaded</div>
+<p id="no-bundle-msg" class="text-on-surface-variant mb-3 text-xs"></p>
+<ol class="list-decimal ml-5 text-on-surface-variant space-y-1 text-xs">
+<li>Run <b>training/ncmapss_colab_training.ipynb</b> on Google Colab.</li>
+<li>Unzip the downloaded bundle into <b>backend/models/</b>.</li>
+<li>Restart the backend: <b>python -m backend</b></li>
+</ol>
+</div>
+</div>
+<div class="max-w-[1800px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-gutter h-full">
+<!-- Left Column: Main Analytic Area -->
+<div class="lg:col-span-8 xl:col-span-9 flex flex-col gap-gutter">
+<!-- 3D Engine Model Container -->
+<div class="data-card card-shadow flex-1 min-h-[400px] flex flex-col opacity-0 animate-fade-in-up delay-100 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">00 / Digital Twin 3D Engine Model</span>
+<div class="flex items-center gap-2">
+<span id="legendFan" class="w-2 h-2 rounded-full bg-gray-400 shadow-sm"></span><span class="text-[10px] font-label-sm text-on-surface-variant">Fan</span>
+<span id="legendComp" class="w-2 h-2 rounded-full bg-gray-400 shadow-sm"></span><span class="text-[10px] font-label-sm text-on-surface-variant">Compressor (LPC+HPC)</span>
+<span id="legendTurb" class="w-2 h-2 rounded-full bg-gray-400 shadow-sm"></span><span class="text-[10px] font-label-sm text-on-surface-variant" title="Geometry is illustrative; colours show station temperature, dots show health">Turbine (HPT+LPT)</span>
+</div>
+</div>
+<div class="flex-1 relative bg-gradient-to-b from-[#F8FAFC] to-[#F1F5F9] flex items-center justify-center overflow-hidden">
+<!-- Simulated Grid Background -->
+<div class="absolute inset-0 opacity-30" style="background-image: radial-gradient(#94A3B8 1px, transparent 1px); background-size: 24px 24px;"></div>
+<div class="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent"></div>
+<!-- Photo-Realistic 3D Model via Three.js -->
+<div class="relative z-10 w-full h-full min-h-[400px] flex justify-center cursor-grab active:cursor-grabbing" id="engine-canvas-container">
+    <canvas id="engineCanvas" class="w-full h-full"></canvas>
+    <div id="engine-loading-indicator" class="absolute inset-0 flex flex-col items-center justify-center bg-white/60 backdrop-blur-sm z-10 pointer-events-none transition-opacity duration-300">
+        <div class="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin mb-2"></div>
+        <span class="text-xs font-label-sm text-primary font-semibold tracking-wider">LOADING 3D TWIN MODEL...</span>
+    </div>
+</div>
+<!-- Overlay Module Info Card -->
+<div id="compCard" class="absolute top-4 left-4 bg-white/95 backdrop-blur-md border border-outline-variant/50 p-3 rounded-lg shadow-xl text-xs w-48 transition-all hover:shadow-2xl z-20">
+<div class="flex justify-between items-center mb-2">
+<strong id="cc-title" class="font-headline-sm text-primary bg-clip-text text-transparent bg-gradient-to-r from-primary to-surface-tint uppercase">TURBINE MODULE</strong>
+<span id="cc-close" class="material-symbols-outlined text-[14px] cursor-pointer text-outline hover:text-on-surface">close</span>
+</div>
+<div class="flex items-center gap-1 text-[#F97316] mb-2 font-label-sm">
+<span id="cc-dot" class="w-1.5 h-1.5 rounded-full bg-[#F97316] shadow-[0_0_6px_rgba(249,115,22,0.6)]"></span> <span id="cc-status">Normal - HI 0.96</span>
+                                </div>
+<div class="grid grid-cols-2 gap-2 text-label-sm text-on-surface-variant font-label-sm" id="cc-metrics">
+    <!-- Populated by JS -->
+</div>
+<div class="mt-2 text-[10px] text-on-surface-variant leading-tight border-t border-outline-variant/50 pt-2" id="cc-trend">
+                                    <svg id="cc-spark" class="w-full h-6"></svg>
+                                </div>
+</div>
+<div class="absolute bottom-3 right-3 text-[9px] font-label-sm text-outline tracking-wider bg-white/50 backdrop-blur-sm px-2 py-1 rounded border border-outline-variant/30 z-20">
+                                DRAG TO ORBIT · SCROLL TO ZOOM
+                            </div>
+</div>
+</div>
+<!-- Thermodynamics - Brayton Cycle (T-S) -->
+<div class="data-card card-shadow flex flex-col opacity-0 animate-fade-in-up delay-200 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">10 / Core Thermodynamics - Brayton Cycle (T-S)</span>
+</div>
+<div class="flex flex-col xl:flex-row h-full">
+<div class="border-b xl:border-b-0 xl:border-r border-outline-variant/50 p-4 xl:w-2/3 min-w-0">
+<div class="w-full relative bg-gradient-to-br from-[#F8FAFC] to-[#F1F5F9] rounded border border-outline-variant/50 overflow-hidden flex items-center justify-center h-[350px] shadow-inner">
+<!-- Simulated Chart Area -->
+<canvas id="braytonTsCanvas" class="w-full h-full"></canvas>
+<!-- Legend -->
+<div class="absolute top-4 right-4 bg-white/95 p-3 rounded-lg border border-outline-variant/50 text-[10px] font-label-sm shadow-lg backdrop-blur-md">
+<div class="flex items-center gap-2 mb-2"><span class="w-4 h-[1px] border-b-2 border-dashed border-[#94A3B8]"></span> Ideal Brayton Cycle</div>
+<div class="flex items-center gap-2 mb-2"><span class="w-4 h-[3px] bg-gradient-to-r from-[#38bdf8] to-[#0284c7] rounded-full"></span> Measured core cycle</div>
+<div class="flex items-center gap-2 mb-3"><span class="w-4 h-[3px] bg-gradient-to-r from-[#f87171] to-[#dc2626] rounded-full"></span> Irreversibility Losses</div>
+<div class="text-[9px] text-on-surface-variant max-w-[120px] leading-tight">Stations 2 → 30 → 40 (est., virtual T40) → 50. Ideal = isentropic at the measured pressure ratio.</div>
+</div>
+</div>
+</div>
+<div class="p-4 flex flex-col justify-between xl:w-1/3 min-w-0">
+<div class="space-y-6">
+<div>
+<div class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider mb-4 font-semibold">10A / Efficiency Comparison</div>
+<div id="braytonSummaryRow" class="brayton-summary-row mb-4"></div>
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-3" id="effCompareGrid"></div>
+</div>
+<div>
+<div class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider mb-4 font-semibold">10B / Layer 2: Healthy-Engine Reference vs Measured</div>
+<div class="overflow-x-auto rounded-lg border border-outline-variant/50 shadow-sm">
+<table class="w-full text-left border-collapse text-xs">
+<thead class="bg-surface-container-low border-b border-outline-variant/50">
+<tr>
+<th class="py-2.5 px-3 font-label-sm text-[9px] text-outline uppercase tracking-wider">Signal</th>
+<th class="py-2.5 px-3 font-label-sm text-[9px] text-outline uppercase tracking-wider">Healthy (ideal)</th>
+<th class="py-2.5 px-3 font-label-sm text-[9px] text-outline uppercase tracking-wider">Measured</th>
+<th class="py-2.5 px-3 font-label-sm text-[9px] text-outline uppercase tracking-wider">Residual</th>
+</tr>
+</thead>
+<tbody id="braytonTableBody" class="font-data-display text-[11px] text-on-surface bg-white"></tbody>
+</table>
+</div>
+</div>
+</div>
+<div class="mt-4 pt-4 border-t border-outline-variant/50 flex items-center justify-between text-xs font-label-sm text-on-surface-variant">
+<div class="flex items-center gap-2">
+<button id="prevAnomalyBtn" class="hover:text-primary transition-colors flex items-center gap-1 bg-surface-container-lowest p-1.5 rounded border border-outline-variant/30 shadow-sm"><span class="material-symbols-outlined text-[16px]">skip_previous</span></button>
+<button id="playBtn" class="hover:text-primary transition-colors flex items-center gap-1 bg-surface-container-lowest p-1.5 rounded border border-outline-variant/30 shadow-sm"><span id="play-icon" class="material-symbols-outlined text-[16px]">play_arrow</span></button>
+<button id="nextAnomalyBtn" class="hover:text-primary transition-colors flex items-center gap-1 bg-surface-container-lowest p-1.5 rounded border border-outline-variant/30 shadow-sm"><span class="material-symbols-outlined text-[16px]">skip_next</span></button>
+<div class="flex-1 ml-4 h-8"><canvas id="tapeCanvas" class="w-full h-full"></canvas></div>
+
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- Operating Conditions Table -->
+<div class="data-card card-shadow opacity-0 animate-fade-in-up delay-200 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">01 / Flight State &amp; Operating Conditions (cycle means)</span>
+</div>
+<div class="p-0 overflow-x-auto">
+<table class="w-full text-left border-collapse">
+<thead class="bg-gradient-to-b from-surface-container-lowest to-surface-container-low border-b border-outline-variant/50">
+<tr>
+<th class="py-3 px-4 font-label-sm text-[10px] text-outline uppercase tracking-wider">Altitude</th>
+<th class="py-3 px-4 font-label-sm text-[10px] text-outline uppercase tracking-wider">Mach</th>
+<th class="py-3 px-4 font-label-sm text-[10px] text-outline uppercase tracking-wider">Throttle (TRA)</th>
+<th class="py-3 px-4 font-label-sm text-[10px] text-outline uppercase tracking-wider">T2 fan inlet</th>
+<th class="py-3 px-4 font-label-sm text-[10px] text-outline uppercase tracking-wider">Fan speed Nf</th>
+<th class="py-3 px-4 font-label-sm text-[10px] text-outline uppercase tracking-wider">Core speed Nc</th>
+<th class="py-3 px-4 font-label-sm text-[10px] text-outline uppercase tracking-wider">Fuel flow Wf</th>
+<th class="py-3 px-4 font-label-sm text-[10px] text-outline uppercase tracking-wider">Flight class · duration</th>
+</tr>
+</thead>
+<tbody class="bg-white">
+<tr class="font-data-display text-sm text-on-surface hover:bg-surface-container-lowest transition-colors">
+<td id="r-alt" class="py-4 px-4 truncate font-semibold">—</td>
+<td id="r-mach" class="py-4 px-4 truncate font-semibold">—</td>
+<td id="r-tra" class="py-4 px-4 truncate font-semibold">—</td>
+<td id="r-t2" class="py-4 px-4 truncate font-semibold">—</td>
+<td id="r-nf" class="py-4 px-4 truncate font-semibold">—</td>
+<td id="r-nc" class="py-4 px-4 truncate font-semibold">—</td>
+<td id="r-wf" class="py-4 px-4 truncate font-semibold">—</td>
+<td id="r-fc" class="py-4 px-4 truncate font-semibold">—</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+<!-- Right Column: Sidebar Telemetry -->
+<div class="lg:col-span-4 xl:col-span-3 flex flex-col gap-gutter h-full overflow-y-auto pr-2 pb-4">
+<!-- Overall Health Index -->
+<div class="data-card card-shadow opacity-0 animate-fade-in-up delay-200 shrink-0 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">05 / Overall Health (weakest component)</span>
+</div>
+<div class="p-6 flex items-center justify-between">
+<div class="relative w-28 h-28 drop-shadow-md">
+<svg class="w-full h-full gauge-svg" viewBox="0 0 100 100">
+<circle class="gauge-track" cx="50" cy="50" r="42" stroke-width="6"></circle>
+<!-- full circumference = 263.8 (2 * pi * 42). offset = length * (1 - pct) -->
+<circle id="ohiRing" class="gauge-fill-success" cx="50" cy="50" r="42" stroke-width="6" style="stroke-dasharray: 263.8; stroke-dashoffset: 18.46;"></circle>
+</svg>
+<div class="absolute inset-0 flex flex-col items-center justify-center">
+<span id="ohiNum" class="font-headline-lg font-bold text-on-surface truncate">0.93</span>
+<span class="text-[10px] text-[#10B981] font-label-sm truncate font-semibold">HI</span>
+</div>
+</div>
+<div class="flex-1 ml-4 overflow-hidden">
+<div id="statusDot" class="w-2 h-2 rounded-full inline-block mr-1 bg-green-500"></div><div id="statusText" class="inline-block" class="text-[#10B981] font-headline-sm text-sm font-bold mb-1 truncate drop-shadow-sm uppercase">NORMAL</div>
+<p id="ohiDesc" class="text-xs text-on-surface-variant leading-tight">Operating well, no special intervention required.</p>
+<!-- Status bar gradient -->
+<div class="w-full h-1.5 rounded-full mt-3 bg-gradient-to-r from-red-500 via-amber-400 to-[#10B981] shadow-inner border border-outline-variant/20 relative">
+    <div id="ohi-marker" class="absolute top-1/2 -translate-y-1/2 w-2 h-4 bg-white border border-gray-400 shadow rounded-sm" style="right: 5%;"></div>
+</div>
+</div>
+</div>
+</div>
+<!-- Predicted Thrust -->
+<div class="data-card card-shadow opacity-0 animate-fade-in-up delay-300 shrink-0 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">06 / Fuel-Flow Penalty vs Healthy Engine</span>
+</div>
+<div class="p-5">
+<div id="thrustVal" class="font-headline-lg font-bold text-on-surface truncate">—</div>
+<div id="thrustDelta" class="text-xs font-label-sm mb-4 truncate font-semibold"></div>
+<!-- Sparkline (CSS drawn for simplicity/aesthetic) -->
+<div class="h-16 w-full relative border-b border-l border-outline-variant/50 overflow-hidden">
+<svg id="spark-thrust" class="w-full h-full absolute bottom-0" preserveAspectRatio="none" viewBox="0 0 200 50">
+<!-- Dynamic injection -->
+</svg>
+</div>
+</div>
+</div>
+<!-- Confidence / RUL -->
+<div class="data-card card-shadow opacity-0 animate-fade-in-up delay-400 shrink-0 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">08 / Confidence &amp; RUL</span>
+</div>
+<div class="p-5">
+<div class="flex justify-between items-end mb-4">
+<div class="overflow-hidden">
+<div class="text-xs text-on-surface-variant font-label-sm mb-1 truncate tracking-wide">RUL PREDICTION, 90% BAND</div>
+<div id="confNum" class="font-headline-md font-bold text-[#10B981] truncate drop-shadow-sm">89%</div>
+</div>
+<div class="text-right overflow-hidden">
+<div id="confBar" class="h-1 bg-gradient-to-r from-cyan-400 to-teal-400 w-full mb-1 rounded" style="width:0%"></div><div class="font-data-display text-on-surface truncate font-bold"><span id="rulVal">126</span> <span class="text-xs text-outline font-normal">cyc</span></div>
+<div id="sigmaVal" class="text-[10px] text-on-surface-variant font-label-sm truncate font-semibold">±14 cyc</div>
+</div>
+</div>
+<button id="btn-view-trends" class="w-full py-2.5 bg-gradient-to-r from-surface-container to-surface-container-high hover:from-surface-container-high hover:to-surface-container-highest text-primary border border-primary/20 rounded-lg font-label-sm text-xs transition-colors truncate shadow-sm font-semibold">
+                                VIEW DEGRADATION TRENDS
+                            </button>
+</div>
+</div>
+<!-- Component Health -->
+<div class="data-card card-shadow opacity-0 animate-fade-in-up delay-100 shrink-0 border border-outline-variant/50">
+<div class="data-header flex-col items-start gap-1">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">02 / Component Health · Fan · LPC · HPC · HPT · LPT</span>
+<span class="text-[9px] font-label-sm text-on-surface-variant">EKF health estimate ± 1σ · 1 = healthy, 0 = failure level</span>
+</div>
+<div class="px-4 py-2" id="component-cards"></div>
+</div>
+<!-- Physics & Interpretability -->
+<div class="data-card card-shadow opacity-0 animate-fade-in-up delay-400 shrink-0 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">09 / Physics &amp; Interpretability</span>
+</div>
+<div class="p-4 space-y-3">
+<div class="flex justify-between items-center text-sm overflow-hidden"><span class="text-on-surface-variant font-label-sm truncate">HPC efficiency (isentropic proxy)</span><span id="p-eta-hpc" class="shrink-0 ml-2 whitespace-nowrap font-data-display text-on-surface font-semibold">—</span></div>
+<div class="flex justify-between items-center text-sm overflow-hidden"><span class="text-on-surface-variant font-label-sm truncate">Fan-hub + LPC efficiency (proxy)</span><span id="p-eta-core" class="shrink-0 ml-2 whitespace-nowrap font-data-display text-on-surface font-semibold">—</span></div>
+<div class="flex justify-between items-center text-sm overflow-hidden"><span class="text-on-surface-variant font-label-sm truncate">EGT (T48) vs healthy engine</span><span id="p-egt" class="shrink-0 ml-2 whitespace-nowrap font-data-display text-on-surface font-semibold">—</span></div>
+<div class="flex justify-between items-center text-sm overflow-hidden"><span class="text-on-surface-variant font-label-sm truncate">Fuel flow vs healthy engine</span><span id="p-wf" class="shrink-0 ml-2 whitespace-nowrap font-data-display text-on-surface font-semibold">—</span></div>
+<div class="flex justify-between items-center text-sm border-b border-outline-variant/50 pb-3 overflow-hidden"><span class="text-on-surface-variant font-label-sm truncate">Turbine efficiency (est., virtual T40)</span><span id="p-eta-turb" class="shrink-0 ml-2 whitespace-nowrap font-data-display text-on-surface font-semibold">—</span></div>
+<div class="pt-2 space-y-2">
+<div class="text-[10px] text-outline font-label-sm uppercase tracking-wider truncate font-semibold">Physics Constraints Check</div>
+<div class="flex justify-between items-center text-sm overflow-hidden"><span class="text-on-surface-variant font-label-sm truncate">Health predictions within [0, 1]</span><span id="chk-eff" class="text-[9px] font-bold border border-[#10B981]/50 bg-[#10B981]/10 text-[#10B981] px-1.5 py-0.5 rounded shadow-sm shrink-0 ml-2 whitespace-nowrap">—</span></div>
+<div class="flex justify-between items-center text-sm overflow-hidden"><span class="text-on-surface-variant font-label-sm truncate">Monotonic health degradation</span><span id="chk-mono" class="text-[9px] font-bold border border-[#10B981]/50 bg-[#10B981]/10 text-[#10B981] px-1.5 py-0.5 rounded shadow-sm shrink-0 ml-2 whitespace-nowrap">—</span></div>
+<div class="flex justify-between items-center text-sm overflow-hidden"><span class="text-on-surface-variant font-label-sm truncate">Kalman efficiencies not improving</span><span id="chk-kf" class="text-[9px] font-bold border border-[#10B981]/50 bg-[#10B981]/10 text-[#10B981] px-1.5 py-0.5 rounded shadow-sm shrink-0 ml-2 whitespace-nowrap">—</span></div>
+</div>
+</div>
+</div>
+<!-- Backend-driven panels (Layers 3-5): hidden until the backend is connected -->
+<div id="backend-panels" class="flex flex-col gap-gutter shrink-0" style="display:none">
+<div class="data-card card-shadow shrink-0 border border-outline-variant/50">
+<div class="data-header flex-col items-start gap-1">
+<div class="flex w-full justify-between items-center"><span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">11 / Explainability</span>
+<select id="explain-target" class="text-[10px] font-label-sm border border-outline-variant/60 rounded px-1 py-0.5 bg-white"><option value="rul">RUL</option><option value="hi_fan">Fan</option><option value="hi_lpc">LPC</option><option value="hi_hpc">HPC</option><option value="hi_hpt">HPT</option><option value="hi_lpt">LPT</option></select></div>
+<span id="model-badge" class="text-[9px] font-label-sm font-bold"></span>
+</div>
+<div class="p-4" id="explain-body"></div>
+</div>
+<div class="data-card card-shadow shrink-0 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">12 / Kalman Filter: Health Parameters &amp; Sensors</span>
+</div>
+<div class="p-4 space-y-2" id="ekf-body"></div>
+</div>
+<div class="data-card card-shadow shrink-0 border border-outline-variant/50">
+<div class="data-header">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">13 / Alerts</span>
+</div>
+<div class="p-4 space-y-1.5" id="alerts-body"></div>
+</div>
+</div>
+<!-- Degradation Trends -->
+<div class="data-card card-shadow opacity-0 animate-fade-in-up delay-400 shrink-0 border border-outline-variant/50" id="trends-card">
+<div class="data-header flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider font-semibold">07 / Degradation Trends</span>
+<div class="flex gap-4">
+<div class="flex items-center gap-1 text-[10px] font-label-sm text-on-surface-variant truncate"><span class="w-3 h-[3px] bg-gradient-to-r from-[#38bdf8] to-[#0284c7] rounded-full"></span> Weakest-component HI</div>
+<div class="flex items-center gap-1 text-[10px] font-label-sm text-on-surface-variant truncate"><span class="w-3 h-0.5 border-t-2 border-dashed border-[#94A3B8]"></span> RUL</div>
+</div>
+</div>
+<div class="p-4 h-48 relative">
+<svg id="trendChart" class="w-full h-full" preserveAspectRatio="none" viewBox="0 0 1000 100"></svg>
+<div class="absolute left-4 top-4 flex flex-col justify-between h-[calc(100%-2rem)] text-[10px] text-outline font-label-sm font-medium">
+<span class="truncate">1.00</span><span class="truncate">0.75</span><span class="truncate">0.50</span><span class="truncate">0.25</span><span class="truncate">0.00</span>
+</div>
+<div class="absolute right-4 top-4 flex flex-col justify-between h-[calc(100%-2rem)] text-[10px] text-outline font-label-sm text-right font-medium">
+<span id="trend-rul-max" class="truncate">148</span><span id="trend-rul-75" class="truncate">111</span><span id="trend-rul-50" class="truncate">74</span><span id="trend-rul-25" class="truncate">37</span><span class="truncate">0</span>
+</div>
+<div class="absolute bottom-1 left-12 text-[10px] text-outline font-label-sm truncate font-medium">CYC 0</div>
+<div id="trend-cyc-max" class="absolute bottom-1 right-20 text-[10px] text-outline font-label-sm truncate font-medium">CYC 250</div>
+</div>
+</div>
+</div>
+</div>
+</main>
+</div>
+
+<script src="test_script_3.js"></script>
+<script src="maintenance.js"></script>
+</body>
+</html>

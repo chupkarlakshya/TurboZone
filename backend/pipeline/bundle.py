@@ -1,10 +1,15 @@
-"""Layer 4 at serving time: load the bundle exported by training/ncmapss_colab_training.ipynb and run
-Layers 2-4 on per-cycle engine data (+ 0.1 Hz in-flight samples for the CNN), with TreeSHAP and occlusion
-explanations.
+"""Serving side of the pipeline.md pipeline: load the (version 4) bundle exported by
+training/ncmapss_colab_training.ipynb and run it on per-flight engine data.
 
-Bundle layout (backend/models/): manifest.json, reference.json, kf.json, featurizer.json, <model>_<target>.<ext>,
-cnn.onnx, lightgbm_rul_q05.txt / q95.txt, demo_cycles.csv, demo_samples.npz,
-parity_outputs.csv.
+    healthy baseline -> residuals -> EKF (states, uncertainty, innovations) -> causal features
+    -> Random Forest / XGBoost / LightGBM / CatBoost -> scaler + Ridge -> RUL (+ empirical interval)
+    health indices = EKF parameter estimates mapped with the per-component failure-level damage d_ref
+
+Explanations: TreeSHAP of the base models (weighted by the Ridge effective weights), per-model Ridge contributions,
+and occlusion per sensor through the whole pipeline (EKF included).
+
+Bundle layout (backend/models/): manifest.json, schema.json, reference.json, ekf.json, featurizer.json, stack.json,
+<model>.<ext> for the four base models, demo_cycles.csv, parity_outputs.csv (+ result tables).
 """
 from __future__ import annotations
 
@@ -15,12 +20,15 @@ import numpy as np
 import pandas as pd
 
 from . import ncmapss as nc
+from . import physics_monitors as pm
+from . import stacking as st
 
-TREE_TYPES = ("xgboost", "lightgbm", "catboost", "randomforest")
+BUNDLE_VERSION = 4
+MODEL_EXT = {"randomforest": "joblib", "xgboost": "json", "lightgbm": "txt", "catboost": "cbm"}
 
 
 def _finite(o):
-    """NaN/inf -> None so manifest metrics stay JSON-serialisable (e.g. corr of a never-degrading component)."""
+    """NaN/inf -> None so manifest metrics stay JSON-serialisable."""
     if isinstance(o, dict):
         return {k: _finite(v) for k, v in o.items()}
     if isinstance(o, list):
@@ -30,7 +38,7 @@ def _finite(o):
     return o
 
 
-def load_tree(kind: str, path: str):
+def load_model(kind: str, path: str):
     if kind == "xgboost":
         import xgboost as xgb
         m = xgb.XGBRegressor()
@@ -50,43 +58,23 @@ def load_tree(kind: str, path: str):
     raise ValueError(f"Unknown model type {kind}")
 
 
-class OnnxCNN:
-    """Multi-output 1D-CNN over 0.1 Hz in-flight windows, exported to ONNX: (batch, window, C) -> (batch, n_targets)."""
-
-    def __init__(self, path: str, window: int, encoder: nc.SampleEncoder, outputs: list[str]):
-        import onnxruntime as ort
-        self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-        self.window, self.encoder, self.outputs = window, encoder, list(outputs)
-
-    def predict_windows(self, w: np.ndarray) -> np.ndarray:
-        return self.sess.run(None, {"window": w.astype(np.float32)})[0]
-
-    def cycle_predictions(self, samples, cyc, ref, occlude=None):
-        return nc.cnn_cycle_predictions(self.predict_windows, self.encoder, samples, cyc, ref, self.window, occlude)
-
-
-def load_samples(path: str) -> pd.DataFrame:
-    z = np.load(path, allow_pickle=False)
-    df = pd.DataFrame(z["values"], columns=[str(c) for c in z["columns"]])
-    df.insert(0, "cycle", z["cycle"].astype(np.int64))
-    df.insert(0, "unit", z["unit"].astype(np.int64))
-    return df
-
-
 class ModelBundle:
-    def __init__(self, manifest: dict, ref: nc.HealthyReference, kf: nc.GasPathKF, feat: nc.CausalFeaturizer,
-                 trees: dict, quantiles: dict | None = None, demo: pd.DataFrame | None = None,
-                 cnn: OnnxCNN | None = None, demo_samples: pd.DataFrame | None = None):
+    def __init__(self, manifest: dict, ref: nc.HealthyReference, ekf: nc.GasPathEKF, feat: nc.CausalFeaturizer,
+                 models: dict, stack: st.StackModel, demo: pd.DataFrame | None = None,
+                 forecast_models: dict | None = None, comp_rul_models: dict | None = None):
         self.manifest = manifest
-        self.ref, self.kf, self.feat = ref, kf, feat
-        self.trees = trees                    # target -> list of (type, model) in manifest base order (trees only)
-        self.cnn = cnn
-        self.quantiles = quantiles or {}
-        self.demo, self.demo_samples = demo, demo_samples
-        self.targets = manifest["target_order"]
-        self.d_ref = manifest["d_ref"]        # {component: failure-level damage} (one float in older bundles)
-        self.features = manifest["features"]
-        self.smoothing = manifest.get("smoothing", {})
+        self.comp_rul = manifest.get("component_rul") or {}      # optional extension: component RUL (flights)
+        self.comp_rul_models = comp_rul_models or {}               # component -> LightGBM model
+        self.forecast = manifest.get("forecast") or {}           # optional extension: health h flights ahead
+        self.forecast_models = forecast_models or {}               # (component, horizon) -> LightGBM model
+        self.ref, self.ekf, self.feat = ref, ekf, feat
+        self.models, self.stack = models, stack          # name -> fitted base model; Ridge meta-learner
+        self.demo = demo
+        self.d_ref = manifest["d_ref"]
+        self.interval = manifest.get("interval") or {}
+        self.targets = ["rul"] + [f"hi_{c}" for c in nc.COMPONENTS]
+        self.features = feat.feature_names                      # every feature the featurizer computes
+        self.model_features = manifest.get("model_features") or self.features   # the columns the RUL models use
 
     # ------------------------------------------------------------------ loading
     @classmethod
@@ -96,173 +84,184 @@ class ModelBundle:
             raise FileNotFoundError(f"No manifest.json in {model_dir}: unzip the Colab bundle there.")
         with open(mpath, encoding="utf-8") as fh:
             man = _finite(json.load(fh))
-        if man.get("version") != 3:
-            raise ValueError(f"Unsupported bundle version {man.get('version')} (expected 3, N-CMAPSS)")
+        if man.get("version") != BUNDLE_VERSION:
+            raise ValueError(f"Unsupported bundle version {man.get('version')} (expected {BUNDLE_VERSION}): retrain with "
+                             "training/ncmapss_colab_training.ipynb")
 
         def js(name):
             with open(os.path.join(model_dir, man[name]), encoding="utf-8") as fh:
                 return json.load(fh)
 
-        def path_of(rel):
-            return os.path.join(model_dir, rel) if rel and os.path.exists(os.path.join(model_dir, rel)) else None
-
         ref = nc.HealthyReference.from_dict(js("reference_file"))
-        kf = nc.GasPathKF.from_dict(js("kf_file"))
+        ekf = nc.GasPathEKF.from_dict(js("ekf_file"))
         feat = nc.CausalFeaturizer.from_dict(js("featurizer_file"))
         if feat.feature_names != man["features"]:
             raise ValueError("featurizer.json and manifest feature lists differ")
-        trees = {}
-        for tgt, spec in man["targets"].items():
-            trees[tgt] = [(b["type"], load_tree(b["type"], os.path.join(model_dir, b["file"])))
-                          for b in spec["base_models"] if b["type"] in TREE_TYPES]
-        cnn = None
-        c = man.get("cnn")
-        if c and path_of(c.get("file")):
-            cnn = OnnxCNN(path_of(c["file"]), c["window"], nc.SampleEncoder.from_dict(c["encoder"]), c["outputs"])
-        quantiles = {}
-        unc = man.get("uncertainty", {})
-        for key, q in (("rul_q05_file", "q05"), ("rul_q95_file", "q95")):
-            if path_of(unc.get(key)):
-                quantiles[q] = load_tree("lightgbm", path_of(unc[key]))
-        demo = pd.read_csv(path_of(man.get("demo_file"))) if path_of(man.get("demo_file")) else None
-        demo_samples = load_samples(path_of(man.get("demo_samples_file"))) \
-            if path_of(man.get("demo_samples_file")) else None
-        return cls(man, ref, kf, feat, trees, quantiles, demo, cnn, demo_samples)
+        stack = st.StackModel.from_dict(js("stack_file"))
+        models = {b["name"]: load_model(b["name"], os.path.join(model_dir, b["file"])) for b in man["base_models"]}
+        if list(models) != stack.names:
+            raise ValueError("base models and stack.json disagree on the model order")
+        demo = None
+        if man.get("demo_file") and os.path.exists(os.path.join(model_dir, man["demo_file"])):
+            demo = pd.read_csv(os.path.join(model_dir, man["demo_file"]))
+        fmodels = {}
+        fc = man.get("forecast") or {}
+        if fc:
+            expect = feat.feature_names + [f"kf_hi_{c}" for c in nc.COMPONENTS]
+            if fc.get("features") != expect:
+                raise ValueError("forecast feature list differs from featurizer.json + EKF health columns")
+            for c, by_h in (fc.get("files") or {}).items():
+                for h, fn in by_h.items():
+                    fmodels[(c, int(h))] = load_model("lightgbm", os.path.join(model_dir, fn))
+        cmodels = {}
+        cr = man.get("component_rul") or {}
+        if cr:
+            expect = feat.feature_names + [f"kf_hi_{c}" for c in nc.COMPONENTS]
+            if cr.get("features") != expect:
+                raise ValueError("component RUL feature list differs from featurizer.json + EKF health columns")
+            for c, fn in (cr.get("files") or {}).items():
+                cmodels[c] = load_model("lightgbm", os.path.join(model_dir, fn))
+        return cls(man, ref, ekf, feat, models, stack, demo, fmodels, cmodels)
 
     # ------------------------------------------------------------------ prediction
-    def _available(self, kind: str, have_cnn: bool) -> bool:
-        if kind in TREE_TYPES:
-            return True
-        if kind == "cnn":
-            return have_cnn
-        return False
+    def base_predictions(self, frame: pd.DataFrame) -> np.ndarray:
+        return st.predict_bases(self.models, self.stack.names, frame[self.model_features])
 
-    def _meta(self, tgt, have_cnn: bool):
-        """(blend weights, sequence bases used). Falls back to the tree-only blend when the CNN can't run (no
-        cnn.onnx or no 0.1 Hz samples) - and for older bundles whose GRU is no longer supported."""
-        spec = self.manifest["targets"][tgt]
-        if "constant" in spec:                              # target did not vary in training
-            return spec["meta"], []
-        seq = [b for b in spec["base_models"] if b["type"] not in TREE_TYPES]
-        if all(self._available(b["type"], have_cnn) for b in seq):
-            return spec["meta"], seq
-        return spec["trees_only_meta"], []
+    def _extended_matrix(self, frame: pd.DataFrame, health: pd.DataFrame) -> np.ndarray:
+        """Features of the extension models: all featurizer columns + today's EKF health of every component."""
+        return np.column_stack([frame[self.features].to_numpy(dtype=np.float64)] +
+                               [health[f"kf_hi_{c}"].to_numpy(dtype=np.float64) for c in nc.COMPONENTS])
 
-    def samples_for(self, unit) -> pd.DataFrame | None:
-        if self.demo_samples is None:
-            return None
-        s = self.demo_samples[self.demo_samples["unit"] == int(unit)]
-        return s if len(s) else None
-
-    def cnn_cycle(self, samples: pd.DataFrame | None, df: pd.DataFrame, occlude: str | None = None):
-        """Per-cycle CNN outputs aligned with df rows (sorted by unit, cycle), or None if the CNN can't run."""
-        if self.cnn is None or samples is None or len(samples) == 0:
-            return None
-        return self.cnn.cycle_predictions(samples, df, self.ref, occlude)
-
-    def base_predictions(self, frame: pd.DataFrame, cnn_cycle=None) -> dict:
-        """target -> (n, n_bases) array, columns in manifest base order (trees, then sequence models if used)."""
-        x = frame[self.features]
-        have_cnn = cnn_cycle is not None
-        out = {}
-        for tgt in self.targets:
-            cols = [np.asarray(m.predict(x), dtype=np.float64).reshape(-1) for _, m in self.trees[tgt]]
-            for b in self._meta(tgt, have_cnn)[1]:
-                cols.append(cnn_cycle[:, b["output_index"]])
-            out[tgt] = np.column_stack(cols) if cols else np.zeros((len(frame), 0))
+    def _component_rul(self, frame: pd.DataFrame, health: pd.DataFrame) -> dict:
+        """crul_<component> = flights until the component's health reaches its failure level (model output, clipped to
+        [0, cap]) with empirical lo/hi; the dashboard shows it only while the EKF health is below `show_below`."""
+        data = self._extended_matrix(frame, health)
+        cap = float(self.comp_rul.get("cap", 100.0))
+        out, intervals = {}, self.comp_rul.get("intervals", {})
+        for c, m in self.comp_rul_models.items():
+            pred = np.clip(np.asarray(m.predict(data), dtype=np.float64).reshape(-1), 0.0, cap)
+            out[f"crul_{c}"] = pred
+            iv = intervals.get(c) or {}
+            if "low" in iv:
+                out[f"crul_{c}_lo"] = np.clip(pred + iv["low"], 0.0, cap)
+                out[f"crul_{c}_hi"] = np.clip(pred + iv["high"], 0.0, cap)
         return out
 
-    @staticmethod
-    def _clip(tgt, v):
-        return nc.clip_target(tgt, v)
+    def _forecast(self, frame: pd.DataFrame, health: pd.DataFrame) -> dict:
+        """fc_<component>_h<h> = clip(current EKF health + learned change over h flights), with empirical lo/hi."""
+        data = self._extended_matrix(frame, health)
+        out, intervals = {}, self.forecast.get("intervals", {})
+        for (c, h), m in self.forecast_models.items():
+            cur = health[f"kf_hi_{c}"].to_numpy(dtype=np.float64)
+            pred = np.clip(cur + np.asarray(m.predict(data), dtype=np.float64).reshape(-1), 0.0, 1.0)
+            out[f"fc_{c}_h{h}"] = pred
+            iv = (intervals.get(c) or {}).get(str(h)) or {}
+            if "low" in iv:
+                out[f"fc_{c}_h{h}_lo"] = np.clip(pred + iv["low"], 0.0, 1.0)
+                out[f"fc_{c}_h{h}_hi"] = np.clip(pred + iv["high"], 0.0, 1.0)
+        return out
 
-    def predict_frame(self, frame: pd.DataFrame, cnn_cycle=None) -> pd.DataFrame:
-        units, cycles = frame["unit"].to_numpy(), frame["cycle_id"].to_numpy()
-        if cnn_cycle is not None and not np.isfinite(cnn_cycle).all():
-            cnn_cycle = None if not np.isfinite(cnn_cycle).any() else cnn_cycle
-        base = self.base_predictions(frame, cnn_cycle)
-        res = {}
-        for tgt in self.targets:
-            meta, _ = self._meta(tgt, cnn_cycle is not None)
-            b = base[tgt]
-            tm = self.manifest["targets"][tgt]["trees_only_meta"]
-            n_tree = len(self.trees[tgt])
-            trees_only = b[:, :n_tree] @ np.asarray(tm["coef"]) + tm["intercept"]
-            raw = b @ np.asarray(meta["coef"]) + meta["intercept"]
-            raw = np.where(np.isfinite(raw), raw, trees_only)          # cycles without 0.1 Hz samples
-            a = float(self.smoothing.get(tgt, 1.0))
-            res[f"{tgt}_raw"] = raw
-            res[tgt] = nc.smooth_target(tgt, units, cycles, raw, a)
-            res[f"{tgt}_trees_only"] = nc.smooth_target(tgt, units, cycles, trees_only, a)
-            bb = self._clip(tgt, b)
-            res[f"{tgt}_spread"] = np.nanstd(bb, axis=1) if b.shape[1] else np.zeros(len(b))
-        x = frame[self.features]
-        for q, m in self.quantiles.items():
-            res[f"rul_{q}"] = np.clip(np.asarray(m.predict(x), dtype=np.float64), 0, None)
+    def predict_frame(self, frame: pd.DataFrame, health: pd.DataFrame, forecast: bool = True) -> pd.DataFrame:
+        """frame: featurizer output; health: kf_hi_<component> (+ _sigma) columns aligned with frame rows."""
+        base = self.base_predictions(frame)
+        raw = self.stack.predict(base)
+        contrib = self.stack.contributions(base)
+        res = {"rul_raw": raw, "rul": np.clip(raw, 0, None), "rul_trees_only": np.clip(base.mean(axis=1), 0, None),
+               "rul_spread": base.std(axis=1)}
+        for i, n in enumerate(self.stack.names):
+            res[f"base_{n}"] = base[:, i]
+            res[f"contrib_{n}"] = contrib[:, i]
+        if "low" in self.interval:                       # empirical residual quantiles (per predicted-RUL range)
+            res["rul_q05"], res["rul_q95"] = st.apply_interval(res["rul"], self.interval)
+        for c in nc.COMPONENTS:                          # health = EKF estimate mapped by d_ref (not an ML target)
+            h = health[f"kf_hi_{c}"].to_numpy(dtype=np.float64)
+            res[f"hi_{c}"] = res[f"hi_{c}_raw"] = res[f"hi_{c}_trees_only"] = h
+            res[f"hi_{c}_spread"] = health[f"kf_hi_{c}_sigma"].to_numpy(dtype=np.float64)
+        if forecast and self.forecast_models:
+            res.update(self._forecast(frame, health))
+        if forecast and self.comp_rul_models:
+            res.update(self._component_rul(frame, health))
         return pd.DataFrame(res, index=frame.index)
 
-    def run(self, cyc: pd.DataFrame, samples: pd.DataFrame | None = None) -> pd.DataFrame:
-        """Per-cycle table (aggregated columns) [+ 0.1 Hz samples] -> Layers 2-4 outputs, one row per cycle."""
-        df = nc.run_layers_1_to_3(cyc, self.ref, self.kf, self.d_ref)
+    def run(self, cyc: pd.DataFrame) -> pd.DataFrame:
+        """Per-flight table (aggregated columns) -> all layers, one row per flight (sorted by unit, cycle)."""
+        df = nc.run_layers(cyc, self.ref, self.ekf, self.d_ref)
         frame = self.feat.transform(df)
-        return pd.concat([df, self.predict_frame(frame, self.cnn_cycle(samples, df))], axis=1)
+        # combustor + nozzle physics monitors (first-principles, not learned; see physics_monitors.py)
+        return pd.concat([df, self.predict_frame(frame, df), pm.monitor_columns(df)], axis=1)
 
     # ------------------------------------------------------------------ explanations
-    def tree_shap(self, frame_row: pd.DataFrame, tgt: str, have_cnn: bool = False) -> dict | None:
+    def tree_shap(self, frame_row: pd.DataFrame) -> dict | None:
         try:
             import shap
         except ImportError:
             return None
-        meta, _ = self._meta(tgt, have_cnn)
-        x = frame_row[self.features]
-        total = np.zeros(len(self.features))
+        x = frame_row[self.model_features]
+        w = self.stack.effective_weights()
+        total = np.zeros(len(self.model_features))
         used = []
-        for k, (kind, m) in enumerate(self.trees[tgt]):
-            w = float(meta["coef"][k])
-            if w == 0:
+        for k, name in enumerate(self.stack.names):
+            if w[k] == 0:
                 continue
             try:
-                sv = shap.TreeExplainer(m).shap_values(x)
+                sv = shap.TreeExplainer(self.models[name]).shap_values(x)
             except Exception:
                 continue
-            total += w * np.asarray(sv).reshape(-1)[: len(self.features)]
-            used.append(kind)
+            total += w[k] * np.asarray(sv).reshape(-1)[: len(self.model_features)]
+            used.append(name)
         if not used:
             return None
-        groups = pd.Series(total, index=[nc.source_of(f) for f in self.features]).groupby(level=0).sum()
+        groups = pd.Series(total, index=[nc.source_of(f) for f in self.model_features]).groupby(level=0).sum()
         top_f = np.argsort(-np.abs(total))[:8]
         return {
-            "method": "TreeSHAP of the tree models, weighted by the blend weights (" + ", ".join(used) + ")",
-            "features": [{"name": self.features[i], "value": float(total[i])} for i in top_f],
+            "method": "TreeSHAP of the base models weighted by the Ridge effective weights (" + ", ".join(used) + ")",
+            "features": [{"name": self.model_features[i], "value": float(total[i])} for i in top_f],
             "groups": [{"name": g, "value": float(v)} for g, v in groups.reindex(groups.abs().sort_values(
                 ascending=False).index).head(8).items()],
         }
 
-    def occlusion(self, df_engine: pd.DataFrame, pos: int, tgt: str, base_pred: float, samples=None) -> dict:
-        """Full-stack (trees + sequence model), model-agnostic: for each sensor, pretend it read exactly the
-        healthy-engine value for the whole history up to this cycle (residual 0; dependent physics proxies held at
-        this engine's healthy baseline; 0.1 Hz CNN inputs replaced the same way), re-run the Kalman filter, features
-        and models, and report how much the prediction moves."""
+    def contributions(self, frame_row: pd.DataFrame) -> dict:
+        base = self.base_predictions(frame_row)
+        c = self.stack.contributions(base)[0]
+        return {"intercept": self.stack.intercept,
+                "models": [{"name": n, "prediction": float(base[0, i]), "contribution": float(c[i])}
+                           for i, n in enumerate(self.stack.names)],
+                "note": "contribution = Ridge coefficient x scaled base prediction (not a reliability percentage)"}
+
+    def _value(self, df_hist: pd.DataFrame, tgt: str) -> float:
+        if tgt == "rul":
+            frame = self.feat.transform(df_hist)
+            return float(self.predict_frame(frame, df_hist, forecast=False)["rul"].iloc[-1])
+        return float(df_hist[f"kf_{tgt}"].iloc[-1])
+
+    def occlusion(self, df_engine: pd.DataFrame, pos: int, tgt: str, base_pred: float) -> dict:
+        """For each sensor, pretend it read exactly the healthy-engine value for the whole history up to this flight
+        (residual 0, flight summaries = healthy value, dependent physics proxies held at this engine's early-life
+        median), re-run the EKF, features and models, and report how much the prediction moves."""
         hist = df_engine.iloc[: pos + 1].reset_index(drop=True)
-        b = self.feat.baseline_cycles
+        b = min(10, len(hist))
         rows = []
         for s in nc.XS_VARS:
             mod = hist.copy()
             mod[f"res_{s}"] = 0.0
+            for pre in ("m_", "mn_", "mx_", "ls_"):
+                if f"{pre}{s}" in mod:
+                    mod[f"{pre}{s}"] = mod[f"ref_{s}"]
             for p, deps in nc.PROXY_DEPS.items():
                 if s in deps and f"p_{p}" in mod:
                     mod[f"p_{p}"] = float(np.median(mod[f"p_{p}"].to_numpy()[:b]))
-            k = self.kf.run(mod)
+            k = self.ekf.run(mod)
             for c in k.columns:
                 mod[c] = k[c].to_numpy()
-            frame = self.feat.transform(mod)
-            pred = float(self.predict_frame(frame, self.cnn_cycle(samples, mod, occlude=s))[tgt].iloc[-1])
-            rows.append({"sensor": s, "description": nc.SENSOR_INFO[s][0], "value": base_pred - pred})
+            h = nc.kf_component_health(k, self.d_ref)
+            for c in h.columns:
+                mod[c] = h[c].to_numpy()
+            rows.append({"sensor": s, "description": nc.SENSOR_INFO[s][0], "value": base_pred - self._value(mod, tgt)})
         rows.sort(key=lambda r: -abs(r["value"]))
-        return {"method": "Occlusion to healthy-engine values, full stack incl. sequence model and Kalman filter "
-                          "(value = prediction minus prediction-if-this-sensor-were-healthy)", "sensors": rows}
+        return {"method": "Occlusion to healthy-engine values through the whole pipeline (EKF, features, models); "
+                          "value = prediction minus prediction-if-this-sensor-were-healthy", "sensors": rows}
 
-    def explain(self, df_engine: pd.DataFrame, cycle: int, tgt: str, samples: pd.DataFrame | None = None) -> dict:
+    def explain(self, df_engine: pd.DataFrame, cycle: int, tgt: str) -> dict:
         if tgt not in self.targets:
             raise ValueError(f"Unknown target {tgt}; choose from {self.targets}")
         df_engine = df_engine.sort_values("cycle").reset_index(drop=True)
@@ -271,26 +270,35 @@ class ModelBundle:
             raise KeyError(cycle)
         pos = int(hits[0])
         hist = df_engine.iloc[: pos + 1]
-        frame = self.feat.transform(hist)
-        cc = self.cnn_cycle(samples, hist.reset_index(drop=True))
-        pred = float(self.predict_frame(frame, cc)[tgt].iloc[-1])
-        return {"target": tgt, "cycle": int(cycle), "prediction": pred,
-                "tree_shap": self.tree_shap(frame.iloc[[-1]], tgt, cc is not None),
-                "occlusion": self.occlusion(df_engine, pos, tgt, pred, samples)}
+        pred = self._value(hist, tgt)
+        out = {"target": tgt, "cycle": int(cycle), "prediction": pred,
+               "source": "four-model Ridge stack" if tgt == "rul" else "EKF health estimate (physics, not ML)",
+               "tree_shap": None, "contributions": None,
+               "occlusion": self.occlusion(df_engine, pos, tgt, pred)}
+        if tgt == "rul":
+            frame = self.feat.transform(hist).iloc[[-1]]
+            out["tree_shap"] = self.tree_shap(frame)
+            out["contributions"] = self.contributions(frame)
+        return out
 
     # ------------------------------------------------------------------ info
     def info(self) -> dict:
         m = self.manifest
-        have_cnn = self.cnn is not None
-        weights = {}
-        for t in self.targets:
-            meta, seq = self._meta(t, have_cnn)
-            names = [k for k, _ in self.trees[t]] + [b["type"] for b in seq]
-            weights[t] = dict(zip(names, meta["coef"]))
         return {
-            "name": "N-CMAPSS physics-informed stack", "ml": True, "dataset": m.get("dataset"), "run": m.get("run"),
-            "files": m.get("files"), "targets": self.targets, "cnn_used": have_cnn,
-            "blend_weights": weights, "model_choice": m.get("model_choice"), "smoothing": self.smoothing,
-            "d_ref": self.d_ref, "metrics": m.get("metrics"), "kf_quality_test": m.get("kf_quality_test"),
-            "label_summary": m.get("label_summary"),
+            "name": "N-CMAPSS physics-informed EKF + stacking ensemble (pipeline.md)", "ml": True,
+            "dataset": m.get("dataset"), "run": m.get("run"), "files": m.get("files"), "targets": self.targets,
+            "health_source": "EKF parameter estimates mapped by per-component failure-level damage (d_ref)",
+            "states": self.ekf.state_names, "base_models": self.stack.names,
+            "blend": {"alpha": self.stack.alpha, "intercept": self.stack.intercept,
+                      "coef": dict(zip(self.stack.names, self.stack.coef.tolist())),
+                      "effective_weight": dict(zip(self.stack.names, self.stack.effective_weights().tolist()))},
+            "ekf_in_rul": (m.get("metrics") or {}).get("ekf_in_rul"),
+            "interval": self.interval, "d_ref": self.d_ref, "metrics": m.get("metrics"),
+            "reliability": m.get("reliability"), "observability": m.get("observability"),
+            "splits": {k: len(v) for k, v in (m.get("splits") or {}).items()},
+            "forecast": {k: self.forecast.get(k) for k in ("horizons", "target", "model", "useful", "metrics")}
+            if self.forecast else None,
+            "component_rul": {k: self.comp_rul.get(k) for k in ("level", "cap", "show_below", "useful", "metrics", "target")}
+            if self.comp_rul else None,
+            "fingerprints": m.get("dataset_fingerprints"), "build": m.get("build"),
         }
